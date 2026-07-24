@@ -1,0 +1,42 @@
+# NH17-100-BT-48E — 型号默认值见 ethercat_joint_common；当前仅配置 1 轴（可扩至 ≤7）
+/**:
+  ros__parameters:
+    motor_model: "NH17-100-BT-48E"
+    motor_count: 1
+    motor_names: ["joint_1"]
+    gear_ratios: [101.0]
+    encoder_resolutions: [65536.0]
+    output_side_encoder: [false]
+    max_current_ma: [4602.0]
+    torque_constants: [0.030]
+    gear_efficiencies: [0.6]
+    rated_torques: [0.297]
+    velocity_limit_deg_s: 246.0
+    rt_cpu: 4
+    # 零力拖动（电流域，辨识前默认 kg=1 / kf=0；参数单位见 SetDragParams.srv）
+    drag_gravity_a: [0.0]
+    drag_gravity_b: [0.0]
+    drag_gravity_bias: [0.0]
+    # 摩擦：正反向 + 低速 Stribeck；*_neg 省略则与正向相同
+    drag_friction_viscous: [0.0]
+    drag_friction_coulomb: [0.0]
+    drag_friction_stribeck: [0.0]
+    drag_friction_v_eps: [0.05]
+    drag_friction_v_blend: [0.05]
+    drag_friction_v_s: [0.1]
+    drag_friction_stribeck_delta: [1.0]
+    drag_kg: [1.0]
+    drag_kf: [0.0]
+    drag_damping: [0.05]
+    drag_trim: [0.0]
+    drag_ka: [0.0]
+    drag_ext_deadzone_a: [0.0]
+    drag_ext_lpf_hz: [8.0]
+    drag_j_eq: [0.1]
+    drag_observer_ko: [30.0]
+    drag_md: [0.0]
+    drag_dd: [1.0]
+    drag_assist_limit_a: [1.0]
+    drag_current_limit_a: [2.0]
+    drag_velocity_limit_rad_s: [2.0]
+    drag_arm_ramp_s: 1.0

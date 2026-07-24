@@ -1,0 +1,47 @@
+# 三木禾 SJD-17-120-NN-S00 — 当前仅配置 1 轴（可扩至 ≤7）
+/**:
+  ros__parameters:
+    motor_model: "SJD-17-120-NN-S00"
+    motor_count: 1
+    motor_names: ["joint_1"]
+    gear_ratios: [1.0]
+    torque_gear_ratios: [120.0]
+    encoder_resolutions: [524288.0]
+    output_side_encoder: [true]
+    # 千分比相对模组瞬间峰值转矩 112 Nm → 电机侧 112/120
+    rated_torques: [0.933333]
+    torque_constants: [0.1075]
+    gear_efficiencies: [1.0]
+    velocity_limit_deg_s: 225.0
+    # 台架辨识结果（重力 + 摩擦）；启动加载；CSP 抱位后 /set_drag_mode active 进入
+    # 2026-07-17：重力/摩擦拟合 + 台架定稿 kg=1.0、damping=0.05、ka=8 / assist_limit=0.4
+    drag_gravity_a: [-0.499453]
+    drag_gravity_b: [1.26509]
+    drag_gravity_bias: [0.010257]
+    drag_friction_viscous: [1.0]
+    drag_friction_viscous_neg: [1.0]
+    drag_friction_coulomb: [0.874448]
+    drag_friction_coulomb_neg: [0.877337]
+    drag_friction_stribeck: [0.7]
+    drag_friction_stribeck_neg: [0.7]
+    drag_friction_v_eps: [0.05]
+    drag_friction_v_blend: [0.05]
+    drag_friction_v_s: [0.05]
+    drag_friction_stribeck_delta: [1.0]
+    drag_kg: [1.0]
+    drag_kf: [1.0]
+    drag_damping: [0.05]
+    drag_trim: [0.0]
+    # 惯量整形助力（台架：ka=8、assist_limit=0.4 起步加速更轻且可接受）
+    drag_ka: [8.0]
+    drag_ext_deadzone_a: [0.0]
+    drag_ext_lpf_hz: [8.0]
+    drag_j_eq: [0.1]
+    drag_observer_ko: [30.0]
+    # 空则启动时按 Kt·N·η 自动填（SJD17≈12.9 Nm/A）
+    drag_md: [0.0]
+    drag_dd: [1.0]
+    drag_assist_limit_a: [0.4]
+    drag_current_limit_a: [1.5]
+    drag_velocity_limit_rad_s: [1.5]
+    drag_arm_ramp_s: 1.0

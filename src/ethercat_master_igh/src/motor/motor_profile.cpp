@@ -37,6 +37,25 @@ MotorKinematicsParams makeSjd17Kinematics()
     return p;
 }
 
+MotorKinematicsParams makePmslmLinearKinematics()
+{
+    // Linear axis abuse of rotary kinematics: treat 1 mm as 1 "degree".
+    // pulse = mm/360 * encoder_resolution → with enc=360000 → pulse = mm * 1000
+    // (matches legacy ethercat_controller position_scale=1000 pulses/mm).
+    MotorKinematicsParams p;
+    p.gear_ratio = 1.0;
+    p.torque_gear_ratio = 1.0;
+    p.encoder_resolution = 360000.0;
+    p.motor_encoder_resolution = 360000.0;
+    p.output_side_encoder = true;
+    p.velocity_on_motor_encoder = false;
+    p.rated_torque_motor = 15.6;  // thrust scale companion (legacy thrust_scale=1000/15.6)
+    p.max_current_ma = 0.0;
+    p.torque_constant_kt = 0.0;
+    p.gear_efficiency = 1.0;
+    return p;
+}
+
 const std::vector<MotorProfile> kProfiles = {
     {
         "NH17-100-BT-48E",
@@ -61,6 +80,18 @@ const std::vector<MotorProfile> kProfiles = {
         225.0,
         0U,
         false,
+    },
+    {
+        "PMSLM-LINEAR",
+        "并联直线电机 PMSLM（1°:=1mm，脉冲/mm=1000）",
+        {
+            {0x00418108, 0x00009252},
+        },
+        PdoLayout::JOINT_MODULE,
+        makePmslmLinearKinematics(),
+        500.0,  // deg/s ≡ mm/s soft limit hint
+        0U,
+        true,
     },
 };
 

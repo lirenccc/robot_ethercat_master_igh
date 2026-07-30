@@ -10,16 +10,23 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_package(ament_cmake REQUIRED)
 
-find_library(ETHERCAT_LIB ethercat PATHS /opt/etherlab/lib /usr/lib /usr/local/lib)
-if(NOT ETHERCAT_LIB)
-  message(FATAL_ERROR "libethercat not found. Install IgH EtherCAT Master userspace (e.g. /opt/etherlab).")
-endif()
-
-set(ETHERCAT_INCLUDES /opt/etherlab/include)
 if(DEFINED ENV{ETHERLAB_ROOT} AND NOT "$ENV{ETHERLAB_ROOT}" STREQUAL "")
-  set(ETHERCAT_INCLUDES "$ENV{ETHERLAB_ROOT}/include")
-  find_library(ETHERCAT_LIB ethercat PATHS "$ENV{ETHERLAB_ROOT}/lib" REQUIRED)
+  set(_etherlab_root "$ENV{ETHERLAB_ROOT}")
+  find_library(ETHERCAT_LIB ethercat PATHS "${_etherlab_root}/lib" REQUIRED)
+  find_path(ETHERCAT_INCLUDES ecrt.h PATHS "${_etherlab_root}/include" REQUIRED)
+else()
+  find_library(ETHERCAT_LIB ethercat PATHS /opt/etherlab/lib /usr/lib /usr/local/lib)
+  if(NOT ETHERCAT_LIB)
+    message(FATAL_ERROR
+      "libethercat not found. Install IgH userspace (prefix=/usr or /opt/etherlab), "
+      "or set ETHERLAB_ROOT.")
+  endif()
+  find_path(ETHERCAT_INCLUDES ecrt.h
+    PATHS /opt/etherlab/include /usr/include /usr/local/include
+    REQUIRED)
 endif()
+message(STATUS "IgH libethercat: ${ETHERCAT_LIB}")
+message(STATUS "IgH ecrt.h dir:  ${ETHERCAT_INCLUDES}")
 
 add_library(${PROJECT_NAME} SHARED
   src/master/igh/ethercat_sync.cpp

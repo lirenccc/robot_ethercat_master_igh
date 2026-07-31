@@ -56,6 +56,23 @@ MotorKinematicsParams makePmslmLinearKinematics()
     return p;
 }
 
+MotorKinematicsParams makeJmdtKinematics()
+{
+    // 默认取 J1/J2（减速比 120、20bit 编码器）；各轴差异由 motors_jmdt*.yaml overlay。
+    MotorKinematicsParams p;
+    p.gear_ratio = 120.0;
+    p.torque_gear_ratio = 120.0;
+    p.encoder_resolution = 1048576.0;
+    p.motor_encoder_resolution = 1048576.0;
+    p.output_side_encoder = false;
+    p.velocity_on_motor_encoder = true;
+    p.rated_torque_motor = 0.75;
+    p.max_current_ma = 0.0;
+    p.torque_constant_kt = 0.0;
+    p.gear_efficiency = 1.0;
+    return p;
+}
+
 const std::vector<MotorProfile> kProfiles = {
     {
         "NH17-100-BT-48E",
@@ -89,9 +106,21 @@ const std::vector<MotorProfile> kProfiles = {
         },
         PdoLayout::JOINT_MODULE,
         makePmslmLinearKinematics(),
-        500.0,  // deg/s ≡ mm/s soft limit hint
+        500.0,
         0U,
         true,
+    },
+    {
+        "COOLDRIVE-JMDT",
+        "CoolDrive JMDT 关节模组（天机 Marvin）",
+        {
+            {0x00000748, 0x00000019},
+        },
+        PdoLayout::COOLDRIVE_JMDT,
+        makeJmdtKinematics(),
+        180.0,
+        0U,
+        false,
     },
 };
 
@@ -157,6 +186,7 @@ const char* MotorProfileRegistry::pdoLayoutName(PdoLayout layout)
     switch (layout) {
         case PdoLayout::JOINT_MODULE: return "joint_module";
         case PdoLayout::GATEWAY: return "gateway";
+        case PdoLayout::COOLDRIVE_JMDT: return "cooldrive_jmdt";
         default: return "unknown";
     }
 }

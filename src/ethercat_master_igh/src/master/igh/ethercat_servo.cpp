@@ -45,6 +45,11 @@ inline bool isJointModuleMotor(const MotorConfig& cfg)
     return cfg.pdo_layout == PdoLayout::JOINT_MODULE;
 }
 
+inline bool isCoolDriveJmdtMotor(const MotorConfig& cfg)
+{
+    return cfg.pdo_layout == PdoLayout::COOLDRIVE_JMDT;
+}
+
 inline bool isGateway(const MotorConfig& cfg)
 {
     return cfg.vendor_id == kGatewayVendorId && cfg.product_code == kGatewayProductCode;
@@ -751,6 +756,46 @@ bool EtherCATServo::configurePDOMapping()
             } else {
                 std::cout << "  ✓ TxPDO (0x1A00): 6041/6064/606C/6077/6061 + padding" << std::endl;
             }
+            continue;
+        }
+
+        if (isCoolDriveJmdtMotor(cfg)) {
+            std::cout << "  ▶ CoolDrive JMDT PDO 0x1600/0x1A00"
+                      << " (Rx:6040/6060/5FFE/607A/60FF/6071; Tx:+0x310B)" << std::endl;
+            static const ec_pdo_entry_info_t jmdt_rx_entries[] = {
+                {0x6040, 0x00, 16},
+                {0x6060, 0x00, 8},
+                {0x5FFE, 0x00, 8},
+                {0x607A, 0x00, 32},
+                {0x60FF, 0x00, 32},
+                {0x6071, 0x00, 16},
+            };
+            static const ec_pdo_entry_info_t jmdt_tx_entries[] = {
+                {0x6041, 0x00, 16},
+                {0x6061, 0x00, 8},
+                {0x5FFE, 0x00, 8},
+                {0x6064, 0x00, 32},
+                {0x606C, 0x00, 32},
+                {0x6077, 0x00, 16},
+                {0x310B, 0x00, 32},
+            };
+            static const ec_pdo_info_t jmdt_rx_pdos[] = {
+                {0x1600, 6, jmdt_rx_entries},
+            };
+            static const ec_pdo_info_t jmdt_tx_pdos[] = {
+                {0x1A00, 7, jmdt_tx_entries},
+            };
+            const ec_sync_info_t jmdt_syncs[] = {
+                {2, EC_DIR_OUTPUT, 1, jmdt_rx_pdos, EC_WD_ENABLE},
+                {3, EC_DIR_INPUT,  1, jmdt_tx_pdos, EC_WD_DISABLE},
+                {0xFF, EC_DIR_INVALID, 0, nullptr, EC_WD_DISABLE},
+            };
+            if (ecrt_slave_config_pdos(slave_configs_[i], EC_END, jmdt_syncs) != 0) {
+                std::cerr << "❌ Failed to configure PDOs for CoolDrive JMDT " << i << std::endl;
+                return false;
+            }
+            std::cout << "  ✓ RxPDO (0x1600): 6040/6060/5FFE/607A/60FF/6071" << std::endl;
+            std::cout << "  ✓ TxPDO (0x1A00): 6041/6061/5FFE/6064/606C/6077/310B" << std::endl;
             continue;
         }
         
@@ -1607,6 +1652,74 @@ bool EtherCATServo::registerPDOEntries()
                       << " at=" << offsets.actual_torque << " od=" << offsets.operation_mode_display
                       << " sf=" << offsets.sensor_force_2020
                       << " me=" << offsets.motor_encoder_2021 << std::endl;
+            if (!verifyPdoEvidence(i)) {
+                return false;
+            }
+            continue;
+        }
+
+        if (isCoolDriveJmdtMotor(cfg)) {
+            const char* tag = "JMDT";
+            std::cout << "Registering CoolDrive JMDT PDO for motor " << i << "..." << std::endl;
+            memset(&offsets, 0, sizeof(PDOOffsets));
+            int ret = 0;
+
+            ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i], 0x6040, 0x00, domain_, nullptr);
+            if (ret < 0) { std::cerr << tag << ": Failed to register 0x6040" << std::endl; return false; }
+            offsets.control_word = ret;
+
+            ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i], 0x6060, 0x00, domain_, nullptr);
+            if (ret < 0) { std::cerr << tag << ": Failed to register 0x6060" << std::endl; return false; }
+            offsets.operation_mode = ret;
+
+            // 0x5FFE padding — register by SM position (Rx entry index 2)
+            ret = ecrt_slave_config_reg_pdo_entry_pos(slave_configs_[i], 2, 0, 2, domain_, nullptr);
+            if (ret < 0) { std::cerr << tag << ": Failed to register Rx 0x5FFE pad" << std::endl; return false; }
+            offsets.padding_rx = ret;
+
+            ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i], 0x607A, 0x00, domain_, nullptr);
+            if (ret < 0) { std::cerr << tag << ": Failed to register 0x607A" << std::endl; return false; }
+            offsets.target_position = ret;
+
+            ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i], 0x60FF, 0x00, domain_, nullptr);
+            if (ret < 0) { std::cerr << tag << ": Failed to register 0x60FF" << std::endl; return false; }
+            offsets.target_velocity = ret;
+
+            ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i], 0x6071, 0x00, domain_, nullptr);
+            if (ret < 0) { std::cerr << tag << ": Failed to register 0x6071" << std::endl; return false; }
+            offsets.target_torque = ret;
+
+            ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i], 0x6041, 0x00, domain_, nullptr);
+            if (ret < 0) { std::cerr << tag << ": Failed to register 0x6041" << std::endl; return false; }
+            offsets.status_word = ret;
+
+            ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i], 0x6061, 0x00, domain_, nullptr);
+            if (ret < 0) { std::cerr << tag << ": Failed to register 0x6061" << std::endl; return false; }
+            offsets.operation_mode_display = ret;
+
+            ret = ecrt_slave_config_reg_pdo_entry_pos(slave_configs_[i], 3, 0, 2, domain_, nullptr);
+            if (ret < 0) { std::cerr << tag << ": Failed to register Tx 0x5FFE pad" << std::endl; return false; }
+            offsets.padding_tx = ret;
+
+            ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i], 0x6064, 0x00, domain_, nullptr);
+            if (ret < 0) { std::cerr << tag << ": Failed to register 0x6064" << std::endl; return false; }
+            offsets.actual_position = ret;
+
+            ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i], 0x606C, 0x00, domain_, nullptr);
+            if (ret < 0) { std::cerr << tag << ": Failed to register 0x606C" << std::endl; return false; }
+            offsets.actual_velocity = ret;
+
+            ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i], 0x6077, 0x00, domain_, nullptr);
+            if (ret < 0) { std::cerr << tag << ": Failed to register 0x6077" << std::endl; return false; }
+            offsets.actual_torque = ret;
+
+            // 0x310B 负载端力矩 → 复用 sensor_force_2020 槽位（产品侧同字段读取）
+            ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i], 0x310B, 0x00, domain_, nullptr);
+            if (ret < 0) { std::cerr << tag << ": Failed to register 0x310B" << std::endl; return false; }
+            offsets.sensor_force_2020 = ret;
+            offsets.motor_encoder_2021 = 0;
+
+            std::cout << tag << " PDO " << i << " registration completed (0x310B→sensor_force)." << std::endl;
             if (!verifyPdoEvidence(i)) {
                 return false;
             }
@@ -3369,8 +3482,9 @@ bool EtherCATServo::tryLoadKinematicsFromSdo()
 
         const bool is_sjd17 = (cfg.vendor_id == kSjd17VendorId &&
                                    cfg.product_code == kSjd17ProductCode);
+        const bool is_jmdt = isCoolDriveJmdtMotor(cfg);
 
-        if (is_sjd17) {
+        if (is_sjd17 || is_jmdt) {
             const MotorProfile* profile = MotorProfileRegistry::findByIdentity(
                 cfg.vendor_id, cfg.product_code);
             if (profile) {
@@ -3379,13 +3493,16 @@ bool EtherCATServo::tryLoadKinematicsFromSdo()
                 params[i].encoder_resolution = profile->kinematics.encoder_resolution;
                 params[i].output_side_encoder = profile->kinematics.output_side_encoder;
                 updated = true;
-                std::cout << "  SJD17：沿用 motor_profile 运动学（输出端 enc="
+                std::cout << "  " << (is_jmdt ? "JMDT" : "SJD17")
+                          << "：沿用 motor_profile 运动学（enc="
                           << static_cast<int>(profile->kinematics.encoder_resolution)
                           << "，位置减速比 " << profile->kinematics.gear_ratio
                           << "，力矩减速比 " << profile->kinematics.torque_gear_ratio
                           << "）" << std::endl;
             }
-            std::cout << "[电机" << i << "] SDO 读值: (SJD17 跳过 0x200E/0x2016/0x6075)" << std::endl;
+            std::cout << "[电机" << i << "] SDO 读值: ("
+                      << (is_jmdt ? "JMDT" : "SJD17")
+                      << " 跳过 0x200E/0x2016/0x6075)" << std::endl;
             continue;
         }
 

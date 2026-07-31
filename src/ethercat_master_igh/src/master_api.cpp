@@ -72,6 +72,9 @@ bool Master::map_joints(const std::vector<AxisConfig> & axes, std::string & erro
       case PdoLayout::Gateway:
         motor.pdo_layout = ethercat_joint::PdoLayout::GATEWAY;
         break;
+      case PdoLayout::CoolDriveJmdt:
+        motor.pdo_layout = ethercat_joint::PdoLayout::COOLDRIVE_JMDT;
+        break;
       case PdoLayout::Unknown:
       default:
         motor.pdo_layout = ethercat_joint::PdoLayout::UNKNOWN;

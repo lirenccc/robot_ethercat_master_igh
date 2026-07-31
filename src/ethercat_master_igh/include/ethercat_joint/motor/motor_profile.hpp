@@ -23,6 +23,8 @@ enum class PdoLayout {
     UNKNOWN = 0,
     JOINT_MODULE,   ///< 标准关节模组 PDO：0x1600/0x1A00（IgH 新奇 14B；SJD17 Tx 22B 含 0x2020/0x2021；新奇 ENI 另可含 0x603F）
     GATEWAY,
+    /** CoolDrive JMDT（天机 Marvin）：Rx 6040/6060/5FFE/607A/60FF/6071；Tx 6041/6061/5FFE/6064/606C/6077/310B */
+    COOLDRIVE_JMDT,
 };
 
 struct SlaveIdentity {

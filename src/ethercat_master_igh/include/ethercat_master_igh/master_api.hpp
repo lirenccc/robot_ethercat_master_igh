@@ -29,6 +29,7 @@ enum class PdoLayout : uint8_t
   Unknown = 0,
   JointModule = 1,
   Gateway = 2,
+  CoolDriveJmdt = 3,
 };
 
 struct AxisConfig

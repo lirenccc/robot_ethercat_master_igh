@@ -3520,6 +3520,22 @@ void EtherCATServo::clearCommFault()
     disarmAllCommandFreshness();
 }
 
+void EtherCATServo::requestSafeOutput()
+{
+    IghMasterRuntime::instance().requestSafeOutput();
+}
+
+bool EtherCATServo::releaseSafeOutput()
+{
+    return startup_evidence_passed_ &&
+        IghMasterRuntime::instance().releaseSafeOutput();
+}
+
+IghJobCycleDiag EtherCATServo::jobCycleDiag() const
+{
+    return IghMasterRuntime::instance().jobCycleDiag();
+}
+
 void EtherCATServo::disarmAllCommandFreshness()
 {
     for (auto & s : torque_cmd_freshness_) {

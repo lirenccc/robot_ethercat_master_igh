@@ -77,6 +77,8 @@ public:
 
   void raiseCommFault();
   void clearCommFault();
+  void requestSafeOutput();
+  bool releaseSafeOutput();
 
   void setOperational(bool operational)
   {

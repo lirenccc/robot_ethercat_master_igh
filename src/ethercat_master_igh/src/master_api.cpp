@@ -3,6 +3,7 @@
 #include "ethercat_joint/master/igh/igh_master_runtime.hpp"
 #include "ethercat_joint/motor/motor_kinematics.hpp"
 #include "ethercat_joint/servo/cia402.hpp"
+#include "ethercat_joint/servo/ethercat_servo.hpp"
 
 #include <cmath>
 
@@ -14,8 +15,9 @@ constexpr double kRadToDeg = 180.0 / 3.14159265358979323846;
 constexpr double kDegToRad = 3.14159265358979323846 / 180.0;
 }  // namespace
 
-Master::Master(unsigned int master_index)
-: servo_(std::make_unique<ethercat_joint::EtherCATServo>(master_index))
+Master::Master(unsigned int master_index, MotionPolicy policy)
+: servo_(std::make_unique<ethercat_joint::EtherCATServo>(master_index)),
+  motion_policy_(policy)
 {
 }
 
@@ -29,6 +31,10 @@ bool Master::init(std::string & error)
   if (initialized_) {
     return true;
   }
+  if (!servo_) {
+    error = "init: Master instances cannot be restarted after shutdown";
+    return false;
+  }
   // IgH master request happens inside EtherCATServo::initialize.
   initialized_ = true;
   error.clear();
@@ -37,8 +43,14 @@ bool Master::init(std::string & error)
 
 bool Master::map_joints(const std::vector<AxisConfig> & axes, std::string & error)
 {
-  if (axes.empty()) {
-    error = "map_joints: empty axis list";
+  if (!servo_) {
+    error = "map_joints: master has been shut down";
+    return false;
+  }
+  const auto validation = validate_axis_configs(axes);
+  if (validation != AxisConfigError::None) {
+    error = "map_joints: invalid axis configuration (" +
+      std::to_string(static_cast<unsigned>(validation)) + ")";
     return false;
   }
   std::vector<ethercat_joint::MotorConfig> motors;
@@ -46,13 +58,24 @@ bool Master::map_joints(const std::vector<AxisConfig> & axes, std::string & erro
   joint_names_.clear();
   joint_names_.reserve(axes.size());
   for (const auto & axis : axes) {
-    if (axis.joint_name.empty()) {
-      error = "map_joints: joint_name required";
-      return false;
-    }
-    auto motor = axis.motor;
-    if (motor.name.empty()) {
-      motor.name = axis.joint_name;
+    ethercat_joint::MotorConfig motor;
+    motor.alias = axis.alias;
+    motor.position = axis.position;
+    motor.vendor_id = axis.vendor_id;
+    motor.product_code = axis.product_code;
+    motor.name = axis.joint_name;
+    motor.model_id = axis.model_id;
+    switch (axis.pdo_layout) {
+      case PdoLayout::JointModule:
+        motor.pdo_layout = ethercat_joint::PdoLayout::JOINT_MODULE;
+        break;
+      case PdoLayout::Gateway:
+        motor.pdo_layout = ethercat_joint::PdoLayout::GATEWAY;
+        break;
+      case PdoLayout::Unknown:
+      default:
+        motor.pdo_layout = ethercat_joint::PdoLayout::UNKNOWN;
+        break;
     }
     motors.push_back(motor);
     joint_names_.push_back(axis.joint_name);
@@ -70,7 +93,7 @@ bool Master::map_joints(const std::vector<AxisConfig> & axes, std::string & erro
 
 bool Master::start(std::string & error)
 {
-  if (!mapped_) {
+  if (!mapped_ || !servo_) {
     error = "start: call map_joints first";
     return false;
   }
@@ -80,10 +103,17 @@ bool Master::start(std::string & error)
   }
   (void)servo_->tryLoadKinematicsFromSdo();
   (void)servo_->initializePositionsFromSDO();
+  startup_evidence_passed_ = servo_->startupEvidencePassed();
+  motion_commands_authorized_ = motionPolicyAuthorizesCommands(
+    motion_policy_, startup_evidence_passed_);
+  servo_->requestSafeOutput();
 
-  if (!servo_->startupEvidencePassed()) {
+  if (motion_policy_ == MotionPolicy::SupervisedMotion &&
+    !startup_evidence_passed_)
+  {
     error = "IgH startup evidence gate failed (observation-only; enable refused)";
     servo_->deactivate();
+    running_ = false;
     return false;
   }
 
@@ -94,9 +124,11 @@ bool Master::start(std::string & error)
   }
 
   const auto n = axes_.size();
-  for (std::size_t i = 0; i < n; ++i) {
-    servo_->setOperationMode(
-      static_cast<uint8_t>(i), ethercat_joint::OperationMode::CYCLIC_SYNC_POSITION);
+  if (motion_commands_authorized_) {
+    for (std::size_t i = 0; i < n; ++i) {
+      servo_->setOperationMode(
+        static_cast<uint8_t>(i), ethercat_joint::OperationMode::CYCLIC_SYNC_POSITION);
+    }
   }
   running_ = true;
   error.clear();
@@ -124,8 +156,8 @@ bool Master::cycle(
     return false;
   }
 
-  // Job 拥有 PDO；此处只灌 setpoint + 读缓存
-  if (servo_->commFault() || servo_->safeOutputRequired()) {
+  if (servo_->commFault()) {
+    const auto motor_states = servo_->getMotorStates();
     for (std::size_t i = 0; i < n; ++i) {
       AxisState & st = states[i];
       const uint8_t id = static_cast<uint8_t>(i);
@@ -138,41 +170,47 @@ bool Master::cycle(
       st.effort = 0.0;
       st.enabled = false;
       st.fault = true;
-      st.status_word = 0;
+      if (i < motor_states.size()) {
+        st.status_word = motor_states[i].status_word;
+      } else {
+        st.status_word = 0;
+      }
+      st.error_code = 0;
     }
     error = "IgH communication fault (safe-output active)";
     return false;
   }
 
-  for (std::size_t i = 0; i < n; ++i) {
-    const auto & cmd = commands[i];
-    const uint8_t id = static_cast<uint8_t>(i);
-    // operation_mode==0 → leave mode. Effort when axis is CST or this beat requests CST.
-    if (cmd.operation_mode != 0) {
-      servo_->setOperationMode(
-        id, static_cast<ethercat_joint::OperationMode>(cmd.operation_mode));
-    }
-    (void)servo_->setEnable(id, cmd.enable);
-    if (std::isfinite(cmd.position)) {
-      const double deg = cmd.position * kRadToDeg;
-      servo_->setTargetPosition(
-        id, ethercat_joint::MotorKinematics::degreeToPulse(deg, i), true);
-    }
-    if (std::isfinite(cmd.velocity)) {
-      const double deg_s = cmd.velocity * kRadToDeg;
-      servo_->setTargetVelocity(
-        id, ethercat_joint::MotorKinematics::degreePerSecToPulsePerSec(deg_s, i), true,
-        ethercat_joint::SetpointSource::External);
-    }
-    if (std::isfinite(cmd.effort) &&
-      (servo_->getOperationMode(id) ==
-        ethercat_joint::OperationMode::CYCLIC_SYNC_TORQUE ||
-       cmd.operation_mode ==
-        static_cast<int8_t>(ethercat_joint::OperationMode::CYCLIC_SYNC_TORQUE)))
-    {
-      const int16_t raw =
-        ethercat_joint::MotorKinematics::outputTorqueToRaw(cmd.effort, i);
-      servo_->setTargetTorque(id, raw, ethercat_joint::SetpointSource::External);
+  if (motion_commands_authorized_ && !servo_->safeOutputRequired()) {
+    for (std::size_t i = 0; i < n; ++i) {
+      const auto & cmd = commands[i];
+      const uint8_t id = static_cast<uint8_t>(i);
+      if (cmd.operation_mode != 0) {
+        servo_->setOperationMode(
+          id, static_cast<ethercat_joint::OperationMode>(cmd.operation_mode));
+      }
+      (void)servo_->setEnable(id, cmd.enable);
+      if (std::isfinite(cmd.position)) {
+        const double deg = cmd.position * kRadToDeg;
+        servo_->setTargetPosition(
+          id, ethercat_joint::MotorKinematics::degreeToPulse(deg, i), true);
+      }
+      if (std::isfinite(cmd.velocity)) {
+        const double deg_s = cmd.velocity * kRadToDeg;
+        servo_->setTargetVelocity(
+          id,
+          ethercat_joint::MotorKinematics::degreePerSecToPulsePerSec(deg_s, i),
+          true,
+          ethercat_joint::SetpointSource::External);
+      }
+      if (std::isfinite(cmd.effort) &&
+        servo_->getOperationMode(id) ==
+        ethercat_joint::OperationMode::CYCLIC_SYNC_TORQUE)
+      {
+        const int16_t raw =
+          ethercat_joint::MotorKinematics::outputTorqueToRaw(cmd.effort, i);
+        servo_->setTargetTorque(id, raw, ethercat_joint::SetpointSource::External);
+      }
     }
   }
 
@@ -197,6 +235,7 @@ bool Master::cycle(
       st.fault = false;
       st.status_word = 0;
     }
+    st.error_code = 0;
   }
 
   error.clear();
@@ -210,6 +249,7 @@ void Master::shutdown()
     servo_->deactivate();
   }
   mapped_ = false;
+  initialized_ = false;
 }
 
 bool Master::request_safety_reset(std::string & error)
@@ -222,14 +262,77 @@ bool Master::request_safety_reset(std::string & error)
   for (std::size_t i = 0; i < n; ++i) {
     (void)servo_->setEnable(static_cast<uint8_t>(i), false);
   }
-  servo_->clearCommFault();
+  servo_->requestSafetyReset();
+  error.clear();
+  return true;
+}
+
+bool Master::request_fault_reset(uint8_t /*axis_id*/) noexcept
+{
+  return false;
+}
+
+void Master::request_safe_output() noexcept
+{
+  if (servo_) {
+    servo_->requestSafeOutput();
+  }
+}
+
+bool Master::release_safe_output(std::string & error)
+{
+  if (!servo_ || !motion_commands_authorized_) {
+    error = "release_safe_output: motion policy or startup evidence forbids motion";
+    return false;
+  }
+  if (!servo_->releaseSafeOutput()) {
+    error = "release_safe_output: communication latch or healthy dwell active";
+    return false;
+  }
   error.clear();
   return true;
 }
 
 bool Master::motion_reenable_allowed() const
 {
-  return servo_ ? servo_->motionReenableAllowed() : false;
+  return servo_ && motion_commands_authorized_ &&
+    servo_->motionReenableAllowed();
+}
+
+MasterHealth Master::health() const noexcept
+{
+  MasterHealth health;
+  if (!servo_) {
+    return health;
+  }
+  const auto diag = servo_->jobCycleDiag();
+  health.initialized = initialized_;
+  health.operational = servo_->areAllSlavesInOP();
+  health.job_thread_running = servo_->isJobThreadRunning();
+  health.working_counter_complete = diag.last_rx_ok;
+  health.communication_fault = servo_->commFault();
+  health.link_connected = health.operational;
+  health.safe_output_active = servo_->safeOutputRequired();
+  health.observation_only = !motion_commands_authorized_;
+  health.startup_evidence_passed = startup_evidence_passed_;
+  health.motion_commands_authorized = motion_commands_authorized_;
+  health.motion_reenable_allowed =
+    motion_commands_authorized_ && servo_->motionReenableAllowed();
+  health.current_lateness_ns = diag.lateness_ns;
+  health.current_execution_ns = diag.execution_ns;
+  health.max_lateness_ns = diag.max_lateness_ns;
+  health.max_execution_ns = diag.max_execution_ns;
+  health.deadline_miss_count = diag.deadline_miss_count;
+  health.skipped_slots = diag.skipped_slots;
+  health.deadline_met = diag.deadline_met;
+  health.dc_status_valid = diag.dc_status_valid;
+  health.dc_in_sync = diag.dc_in_sync;
+  health.dc_deviation_ns = diag.dc_deviation_ns;
+  health.max_dc_deviation_ns = diag.max_dc_deviation_ns;
+  health.dc_out_of_sync_count = diag.dc_out_of_sync_count;
+  health.dc_out_of_sync_consecutive = diag.dc_out_of_sync_consecutive;
+  health.dc_out_of_sync_window = diag.dc_out_of_sync_window;
+  return health;
 }
 
 void Master::apply_command_contention_fallback()

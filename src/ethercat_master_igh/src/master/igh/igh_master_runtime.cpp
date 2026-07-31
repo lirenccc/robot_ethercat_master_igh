@@ -145,13 +145,32 @@ void IghMasterRuntime::raiseCommFault()
 void IghMasterRuntime::clearCommFault()
 {
   comm_fault_.store(false, std::memory_order_release);
-  safe_output_required_.store(false, std::memory_order_release);
+  // Reset clears the communication latch only; safe-output stays asserted
+  // through healthy dwell until releaseSafeOutput().
+  safe_output_required_.store(true, std::memory_order_release);
   pending_dwell_fault_.store(false, std::memory_order_release);
   wkc_tracker_.reset();
   deadline_tracker_.reset();
   dc_tracker_.reset();
   healthy_dwell_.requestReset();
   motion_reenable_allowed_.store(false, std::memory_order_release);
+}
+
+void IghMasterRuntime::requestSafeOutput()
+{
+  safe_output_required_.store(true, std::memory_order_release);
+  motion_reenable_allowed_.store(false, std::memory_order_release);
+}
+
+bool IghMasterRuntime::releaseSafeOutput()
+{
+  if (comm_fault_.load(std::memory_order_acquire) ||
+    !motion_reenable_allowed_.load(std::memory_order_acquire))
+  {
+    return false;
+  }
+  safe_output_required_.store(false, std::memory_order_release);
+  return true;
 }
 
 void IghMasterRuntime::syncMotionReenableFlag()
@@ -361,9 +380,13 @@ bool IghMasterRuntime::start(EtherCATServo * servo)
   servo_ = servo;
   operational_.store(true, std::memory_order_release);
   comm_fault_.store(false, std::memory_order_release);
-  safe_output_required_.store(false, std::memory_order_release);
-  healthy_dwell_.allowInitialEnable();
-  motion_reenable_allowed_.store(true, std::memory_order_release);
+  healthy_dwell_.reset(config_.healthy_dwell_cycles);
+  if (safe_output_required_.load(std::memory_order_acquire)) {
+    motion_reenable_allowed_.store(false, std::memory_order_release);
+  } else {
+    healthy_dwell_.allowInitialEnable();
+    motion_reenable_allowed_.store(true, std::memory_order_release);
+  }
   timing_tick_.store(0, std::memory_order_relaxed);
   job_seen_tick_ = 0;
   skipped_slots_.store(0, std::memory_order_relaxed);

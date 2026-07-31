@@ -29,6 +29,8 @@ extern "C" {
 
 namespace ethercat_joint {
 
+struct IghJobCycleDiag;
+
 /**
  * @brief 单个电机配置
  */
@@ -124,6 +126,11 @@ public:
     bool safeOutputRequired() const;
     bool motionReenableAllowed() const;
     void clearCommFault();
+    void requestSafeOutput();
+    bool releaseSafeOutput();
+    /** Safety reset entry: same as clearCommFault (clear latch + healthy dwell). */
+    void requestSafetyReset() { clearCommFault(); }
+    IghJobCycleDiag jobCycleDiag() const;
     void applySafeProcessImageOutputs();
 
     /** 启动证据门是否通过；失败时 observation-only，禁止使能 */

@@ -27,8 +27,38 @@ After `Master::start()` succeeds, PDO exchange **must not** be driven by `cycle(
 On `comm_fault` / `safe_output_required`:
 
 - latch actual position, velocity/torque = 0, control word = Shutdown `0x06`
-- `cycle()` stops injecting commands and reports fault
+- `cycle()` stops injecting commands when `motion_commands_authorized_` is false or safe-output is active
 - no implicit Fault Reset (`0x0080`) / re-enable
+
+`Master::start()` always arms safe-output after activation. Release it explicitly with
+`Master::release_safe_output()` only after healthy dwell and when motion policy authorizes
+commands (`SupervisedMotion` + startup evidence passed).
+
+## Motion policy
+
+`Master` accepts `MotionPolicy` (default `ObservationOnly`):
+
+| Policy | Drive SDO config | Cyclic command injection |
+| --- | --- | --- |
+| `ObservationOnly` | no | no |
+| `Commissioning` | yes (when supported) | no |
+| `SupervisedMotion` | yes (when supported) | yes, after startup evidence |
+
+`AxisConfig` is flat (same fields as EC-Master). IgH has no PREOP SDO configure hook yet;
+`Commissioning` / `SupervisedMotion` still run the evidence gate but skip drive SDO policy.
+
+Only `SupervisedMotion` fails `start()` when startup evidence fails. `ObservationOnly` and
+`Commissioning` remain runnable for observation.
+
+## EC-Master-only APIs (for now)
+
+| API | IgH status |
+| --- | --- |
+| `Master::cycle_raw` | not ported |
+| `Master::request_fault_reset` | exposed but returns `false` |
+
+Upper layers should use `Master::health()` for supervision; a successful `cycle()` alone does
+not authorize motion.
 
 ## Cycle skip / deadline metrics
 
@@ -60,9 +90,11 @@ Dev without privileges: explicit `IGH_REQUIRE_REALTIME=0` (never silent).
 
 Recovery:
 
-1. Product `/request_safety_reset` → `Master::request_safety_reset()` — clears latch, **does not** auto-enable
+1. Product `/request_safety_reset` → `Master::request_safety_reset()` — clears comm latch,
+   **keeps** safe-output through dwell; does **not** auto-enable
 2. Healthy dwell (`IGH_HEALTHY_DWELL_CYCLES`, default 50)
-3. `setEnable(true)` only when `motion_reenable_allowed()`
+3. `Master::release_safe_output()` when motion policy authorizes commands
+4. `setEnable(true)` only when `motion_reenable_allowed()`
 
 | Variable | Default |
 | --- | --- |
@@ -86,7 +118,9 @@ After `activate()` reaches OP:
 1. **PDO evidence** — joint modules must expose 0x6041 / 0x6064 / 0x607A (and 0x6040); gateway skipped
 2. **SDO gate 0x60C2** — read-only match to `IGH_BUS_CYCLE_US`; profiles with `require_interpolation_period_gate=false` (e.g. SJD17) skip
 
-Failure → observation-only: state readable, `Master::start()` returns false, `setEnable(true)` refused.
+Failure under `ObservationOnly` / `Commissioning` → observation-only: state readable,
+`start()` still succeeds, `setEnable(true)` refused. Under `SupervisedMotion`, evidence
+failure aborts `start()`.
 
 ## Command freshness (CST / optional CSV)
 

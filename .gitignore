@@ -5,3 +5,5 @@ log/
 *.user
 compile_commands.json
 config/env
+__pycache__/
+*.pyc

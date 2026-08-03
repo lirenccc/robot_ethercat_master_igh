@@ -213,6 +213,12 @@ public:
     bool setEnable(uint8_t motor_id, bool enable);
     
     /**
+     * @brief 显式 CiA402 Fault Reset（须已在 safe-output 且轴失能）
+     * @param motor_id 轴索引，0xFF=全体故障轴
+     */
+    bool requestFaultReset(uint8_t motor_id) noexcept;
+
+    /**
      * @brief 设置操作模式
      * @param motor_id 电机 ID (0xFF = 所有电机)
      * @param mode 操作模式
@@ -619,6 +625,9 @@ private:
 
     bool safe_output_active_{false};
     std::vector<int32_t> safe_latched_positions_;
+    /** 显式 Fault Reset：0xFFFF=无请求；0x00FF=全体；否则为轴索引。 */
+    std::atomic<uint16_t> explicit_fault_reset_axis_{0xFFFFU};
+    std::atomic<uint16_t> explicit_fault_reset_cycles_{0U};
     
     // PDO 快照用 seqlock；使能命令用 AtomicBool/U8/U16（勿在 RT 路径加阻塞 mutex）
 };

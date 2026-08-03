@@ -158,7 +158,10 @@ void IghMasterRuntime::clearCommFault()
 
 void IghMasterRuntime::requestSafeOutput()
 {
-  safe_output_required_.store(true, std::memory_order_release);
+  const bool already = safe_output_required_.exchange(true, std::memory_order_acq_rel);
+  if (already) {
+    return;
+  }
   motion_reenable_allowed_.store(false, std::memory_order_release);
 }
 
@@ -337,11 +340,8 @@ void IghMasterRuntime::jobThreadMain(IghMasterRuntime * self)
 
     self->sampleDcMonitor(servo);
 
-    const bool dc_ok =
-      !self->dc_status_valid_.load(std::memory_order_relaxed) ||
-      self->dc_in_sync_.load(std::memory_order_relaxed);
-    const bool healthy =
-      rx_ok && self->timing_stats_.deadline_met && dc_ok && !self->commFault();
+    // Dwell 只看通信是否可用；deadline/DC 抖动由 anomaly tracker 闩锁，不阻塞再使能计数。
+    const bool healthy = rx_ok && !self->commFault();
     self->healthy_dwell_.observe(healthy);
     self->syncMotionReenableFlag();
 

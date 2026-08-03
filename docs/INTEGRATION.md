@@ -50,12 +50,12 @@ commands (`SupervisedMotion` + startup evidence passed).
 Only `SupervisedMotion` fails `start()` when startup evidence fails. `ObservationOnly` and
 `Commissioning` remain runnable for observation.
 
-## EC-Master-only APIs (for now)
+## API notes
 
-| API | IgH status |
+| API | Status |
 | --- | --- |
 | `Master::cycle_raw` | not ported |
-| `Master::request_fault_reset` | exposed but returns `false` |
+| `Master::request_fault_reset` | safe-output + disabled gate; Fault = 6041 bit3; 10-cycle `0x0080` window |
 
 Upper layers should use `Master::health()` for supervision; a successful `cycle()` alone does
 not authorize motion.

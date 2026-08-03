@@ -70,6 +70,15 @@ inline bool isCiA402OperationEnabled(uint16_t status_word)
     return (status_word & 0x08) == 0 && (status_word & 0x04) != 0;
 }
 
+/**
+ * CiA402 Fault 判定：状态字 bit3。
+ * Fault 与 Fault reaction active 均置该位；勿仅用 decode 结果 == FAULT。
+ */
+inline bool isCiA402Fault(uint16_t status_word) noexcept
+{
+    return (status_word & 0x08U) != 0U;
+}
+
 inline CIA402State decodeCia402State(uint16_t status_word)
 {
     const uint16_t key_bits = status_word & 0x4F;

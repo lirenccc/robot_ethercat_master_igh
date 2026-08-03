@@ -2203,7 +2203,7 @@ void EtherCATServo::sendDataCommon(size_t i, const PDOOffsets& offsets)
 
         // 读取状态字（故障检测 / 使能监控）
         uint16_t sw = EC_READ_U16(domain_pd_ + offsets.status_word);
-        bool has_fault = (sw & 0x08) != 0;
+        bool has_fault = isCiA402Fault(sw);
         bool is_operation_enabled = isCiA402OperationEnabled(sw);
         const CIA402State cia_state = getState(sw);
         const uint16_t cia_state_value = static_cast<uint16_t>(cia_state);
@@ -2225,8 +2225,7 @@ void EtherCATServo::sendDataCommon(size_t i, const PDOOffsets& offsets)
                 last_logged_status_words_[i] = sw;
                 last_logged_cia402_states_[i] = cia_state_value;
 
-                if (has_fault || cia_state == CIA402State::FAULT ||
-                    cia_state == CIA402State::FAULT_REACTION_ACTIVE) {
+                if (has_fault) {
                     RuntimeLogEvent fault_ev = ev;
                     fault_ev.type = RuntimeLogEventType::ERROR_CODE;
                     fault_ev.error_code = 0;
@@ -2542,6 +2541,43 @@ bool EtherCATServo::setEnable(uint8_t motor_id, bool enable)
         fillRuntimeEventTargets(ev, log_motor);
         runtime_logger_->queueCommand(ev);
     }
+    return true;
+}
+
+bool EtherCATServo::requestFaultReset(uint8_t motor_id) noexcept
+{
+    // 门禁与产品侧契约对齐：Job OP + safe-output 已闩 + 无通信闩锁；
+    // 所选轴须已失能且至少一轴 isCiA402Fault（bit3）。
+    if (!initialized_ || !activated_ || !isJobThreadRunning() ||
+        !safeOutputRequired() || commFault() || !areAllSlavesInOP() ||
+        (motor_id != 0xFFU && motor_id >= motor_count_))
+    {
+        return false;
+    }
+
+    bool selected_fault_present = false;
+    for (size_t i = 0; i < motor_count_; ++i) {
+        if (isGateway(motor_configs_[i]) ||
+            (motor_id != 0xFFU && motor_id != static_cast<uint8_t>(i)))
+        {
+            continue;
+        }
+        const uint16_t sw =
+          (i < last_status_words_.size()) ? last_status_words_[i] : 0U;
+        if (isCiA402OperationEnabled(sw)) {
+            return false;
+        }
+        selected_fault_present = selected_fault_present || isCiA402Fault(sw);
+    }
+    if (!selected_fault_present) {
+        return false;
+    }
+
+    explicit_fault_reset_axis_.store(
+        motor_id == 0xFFU ? 0x00FFU : static_cast<uint16_t>(motor_id),
+        std::memory_order_release);
+    // 十个总线周期（4 ms 周期时约 40 ms）内写 0x0080。
+    explicit_fault_reset_cycles_.store(10U, std::memory_order_release);
     return true;
 }
 
@@ -2943,11 +2979,10 @@ std::vector<MotorStateData> EtherCATServo::getMotorStates() const
         MotorStateData state;
         state.motor_id = i;
         state.operation_mode = current_modes_[i];
-        state.enabled = enables[i];
-        
+        state.enabled = enables[i] && isCiA402OperationEnabled(status_words[i]);
+
         state.status_word = status_words[i];
-        CIA402State cia_state = getState(state.status_word);
-        state.fault = (cia_state == CIA402State::FAULT);
+        state.fault = isCiA402Fault(state.status_word);
         
         state.actual_position = positions[i];
         state.target_position = target_positions_[i].load(std::memory_order_acquire);
@@ -3634,6 +3669,8 @@ void EtherCATServo::clearCommFault()
 {
     IghMasterRuntime::instance().clearCommFault();
     safe_output_active_ = false;
+    explicit_fault_reset_cycles_.store(0U, std::memory_order_release);
+    explicit_fault_reset_axis_.store(0xFFFFU, std::memory_order_release);
     disarmAllCommandFreshness();
 }
 
@@ -3787,6 +3824,11 @@ void EtherCATServo::applySafeProcessImageOutputs()
     const bool entering = !safe_output_active_;
     safe_output_active_ = true;
 
+    const uint16_t reset_cycles =
+        explicit_fault_reset_cycles_.load(std::memory_order_acquire);
+    const uint16_t reset_axis =
+        explicit_fault_reset_axis_.load(std::memory_order_acquire);
+
     for (size_t i = 0; i < motor_count_; ++i) {
         const auto & cfg = motor_configs_[i];
         if (cfg.vendor_id == kGatewayVendorId && cfg.product_code == kGatewayProductCode) {
@@ -3801,10 +3843,25 @@ void EtherCATServo::applySafeProcessImageOutputs()
         const auto safe = makeSafeProcessImageOutputs(
           (i < safe_latched_positions_.size()) ? safe_latched_positions_[i] : actual);
 
+        if (entering) {
+            fault_reset_phase_[i] = 0;
+            fault_reset_counter_[i] = 0;
+            enable_fsm_step_[i] = 0;
+            enable_fsm_wait_[i] = 0;
+        }
+
         desired_enable_[i] = false;
         enable_fsm_active_[i] = false;
         enable_requested_[i] = false;
-        control_word_states_[i].store(safe.control_word, std::memory_order_relaxed);
+
+        const uint16_t sw =
+          (i < last_status_words_.size()) ? last_status_words_[i] : 0U;
+        const bool axis_selected =
+          reset_axis == 0x00FFU || reset_axis == static_cast<uint16_t>(i);
+        const uint16_t safe_control_word = selectSafeControlWord(
+          reset_cycles > 0U, axis_selected, isCiA402Fault(sw));
+
+        control_word_states_[i].store(safe_control_word, std::memory_order_relaxed);
         target_positions_[i].store(safe.target_position, std::memory_order_relaxed);
         target_velocities_[i].store(safe.target_velocity, std::memory_order_relaxed);
         target_torques_[i].store(safe.target_torque, std::memory_order_relaxed);
@@ -3815,7 +3872,7 @@ void EtherCATServo::applySafeProcessImageOutputs()
         }
 
         if (offsets.control_word) {
-            EC_WRITE_U16(domain_pd_ + offsets.control_word, safe.control_word);
+            EC_WRITE_U16(domain_pd_ + offsets.control_word, safe_control_word);
         }
         if (offsets.target_position) {
             EC_WRITE_S32(domain_pd_ + offsets.target_position, safe.target_position);
@@ -3830,6 +3887,16 @@ void EtherCATServo::applySafeProcessImageOutputs()
             EC_WRITE_S8(
               domain_pd_ + offsets.operation_mode,
               static_cast<int8_t>(current_modes_[i]));
+        }
+    }
+
+    if (reset_cycles > 0U) {
+        const uint16_t remaining =
+            explicit_fault_reset_cycles_.fetch_sub(
+                1U, std::memory_order_acq_rel) - 1U;
+        if (remaining == 0U) {
+            explicit_fault_reset_axis_.store(
+                0xFFFFU, std::memory_order_release);
         }
     }
 

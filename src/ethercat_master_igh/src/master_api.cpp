@@ -270,9 +270,9 @@ bool Master::request_safety_reset(std::string & error)
   return true;
 }
 
-bool Master::request_fault_reset(uint8_t /*axis_id*/) noexcept
+bool Master::request_fault_reset(uint8_t axis_id) noexcept
 {
-  return false;
+  return running_ && servo_ && servo_->requestFaultReset(axis_id);
 }
 
 void Master::request_safe_output() noexcept

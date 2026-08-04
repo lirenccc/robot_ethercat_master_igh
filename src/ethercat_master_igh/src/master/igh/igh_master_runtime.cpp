@@ -159,10 +159,12 @@ void IghMasterRuntime::clearCommFault()
 void IghMasterRuntime::requestSafeOutput()
 {
   const bool already = safe_output_required_.exchange(true, std::memory_order_acq_rel);
-  if (already) {
-    return;
-  }
   motion_reenable_allowed_.store(false, std::memory_order_release);
+  if (!already) {
+    // 上升沿：禁止使能直至 /request_safety_reset 重计 healthy dwell
+    // 已在 safe 时勿再 onFault，否则会打断 clearCommFault 后的 dwell 计数
+    healthy_dwell_.onFault();
+  }
 }
 
 bool IghMasterRuntime::releaseSafeOutput()

@@ -99,9 +99,10 @@ const std::vector<MotorProfile> kProfiles = {
         makeSjd17Kinematics(),
         225.0,
         0U,
-        0U,
-        0x0000U, // dc_assign_activate: SJD 默认关 DC（free-run）
-        false,   // require_interpolation_period_gate: SJD 无 0x60C2 支持
+        4000000U, // dc_sync0_ns: DC 周期 = 4ms（对齐 ENI CycleTime0）
+        0x0300U,  // dc_assign_activate: 激活 SYNC0（对齐 ENI ReferenceClock=1 启用 DC；
+                  //   free-run 下模式显示不跟随导致拒绝使能）
+        false,    // require_interpolation_period_gate: ENI 无 0x60C2 SDO 下载（仅备用 PDO 含 AlignByte）
     },
     {
         "PMSLM-LINEAR",

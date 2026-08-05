@@ -52,6 +52,23 @@ inline bool isCoolDriveJmdtMotor(const MotorConfig& cfg)
     return cfg.pdo_layout == PdoLayout::COOLDRIVE_JMDT;
 }
 
+inline const char* deviceTypeName(const MotorConfig& cfg) noexcept
+{
+    if (cfg.vendor_id == kGatewayVendorId && cfg.product_code == kGatewayProductCode) {
+        return "网关";
+    }
+    if (cfg.pdo_layout == PdoLayout::COOLDRIVE_JMDT) {
+        return "天机 JMDT 关节模组";
+    }
+    if (cfg.vendor_id == kSjd17VendorId && cfg.product_code == kSjd17ProductCode) {
+        return "三木禾 SJD17 关节模组";
+    }
+    if (cfg.pdo_layout == PdoLayout::JOINT_MODULE) {
+        return "新奇 NH17 关节模组";
+    }
+    return "电机";
+}
+
 const MotorProfile * resolveMotorProfile(const MotorConfig & cfg)
 {
     if (!cfg.model_id.empty()) {
@@ -177,10 +194,7 @@ bool EtherCATServo::initialize(const std::vector<MotorConfig>& motor_configs)
     std::cout << "Initializing EtherCAT with " << motor_count_ << " slaves" << std::endl;
     std::cout << "========================================" << std::endl;
     for (size_t i = 0; i < motor_configs.size(); ++i) {
-        const bool is_gateway = (motor_configs[i].vendor_id == kGatewayVendorId &&
-                                 motor_configs[i].product_code == kGatewayProductCode);
-        const bool is_joint_module = isJointModuleMotor(motor_configs[i]);
-        const char* device_type = is_gateway ? "网关" : (is_joint_module ? "新奇关节模组" : "电机");
+        const char* device_type = deviceTypeName(motor_configs[i]);
         std::cout << "  Slave " << i << ": " << motor_configs[i].name 
                   << " (" << device_type << ")"
                   << " (VID=0x" << std::hex << motor_configs[i].vendor_id 
@@ -247,10 +261,9 @@ bool EtherCATServo::initialize(const std::vector<MotorConfig>& motor_configs)
         const auto& cfg = motor_configs_[i];
         
         // ⭐ 检查是否是网关：仅通过 VID/PID 识别（不再使用"最后一个从站"的判断，避免电机6被错误识别）
-        bool is_gateway = (cfg.vendor_id == kGatewayVendorId && cfg.product_code == kGatewayProductCode);
-        
-        const bool is_joint_module = isJointModuleMotor(cfg);
-        const char* device_type = is_gateway ? "网关" : (is_joint_module ? "新奇关节模组" : "电机");
+        const bool is_gateway = (cfg.vendor_id == kGatewayVendorId &&
+                                 cfg.product_code == kGatewayProductCode);
+        const char* device_type = deviceTypeName(cfg);
         std::cout << "\n配置从站 " << i << " (" << cfg.name << " - " << device_type << ")..." << std::endl;
         
         // ⭐ 所有从站（包含网关）都必须调用 slave_config
@@ -802,7 +815,7 @@ bool EtherCATServo::configurePDOMapping()
     for (size_t i = 0; i < motor_count_; ++i) {
         const auto& cfg = motor_configs_[i];
         
-        // ⭐ 检查是否是网关或新奇关节模组
+        // ⭐ 检查是否是网关或关节模组
         bool is_gateway = (cfg.vendor_id == kGatewayVendorId && cfg.product_code == kGatewayProductCode);
         bool is_joint_module = isJointModuleMotor(cfg);
         

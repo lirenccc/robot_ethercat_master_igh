@@ -152,6 +152,7 @@ void IghMasterRuntime::clearCommFault()
   wkc_tracker_.reset();
   deadline_tracker_.reset();
   dc_tracker_.reset();
+  dc_warmup_remaining_ = config_.dc_monitor_warmup_cycles;
   healthy_dwell_.requestReset();
   motion_reenable_allowed_.store(false, std::memory_order_release);
 }
@@ -292,12 +293,22 @@ void IghMasterRuntime::jobThreadMain(IghMasterRuntime * self)
   while (self->job_running_.load(std::memory_order_acquire)) {
     // Wait for Timing tick (bounded spin + short sleep to avoid busy-burn)
     uint64_t tick = self->timing_tick_.load(std::memory_order_acquire);
+    uint32_t tick_wait_loops = 0U;
     while (tick == self->job_seen_tick_ &&
            self->job_running_.load(std::memory_order_acquire))
     {
-      timespec pause{0, 50000};  // 50 us
+      // 1 ms 让步：aarch64 上 50 us 短睡实际几乎立即返回，会形成 ~100% 忙等
+      timespec pause{0, 1000000};
       nanosleep(&pause, nullptr);
       tick = self->timing_tick_.load(std::memory_order_acquire);
+      if (++tick_wait_loops >= 1000U) {
+        // Timing 线程异常（如长睡/退出）时强制重同步：让 Job 降级以 ~1 Hz 跑，
+        // 避免 FIFO 99 线程忙等饿死系统。
+        std::cerr << "[IgH] job tick watchdog: timing stalled, resync"
+                  << " (loops=" << tick_wait_loops << ")" << std::endl;
+        self->job_seen_tick_ = tick - 1U;
+        break;
+      }
     }
     if (!self->job_running_.load(std::memory_order_acquire)) {
       break;

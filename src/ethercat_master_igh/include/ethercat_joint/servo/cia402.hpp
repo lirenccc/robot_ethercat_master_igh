@@ -45,12 +45,14 @@ enum class CIA402State : uint16_t {
  *   CONTROL_WORD_SWITCH_ON      = Shutdown (0x06)
  *   CONTROL_WORD_ENABLE_VOLTAGE = Switch on (0x07)
  *   CONTROL_WORD_ENABLE_OPERATION / KEEP_OPERATION / FAULT_RESET 名实相符
+ * Fault Reset 用 0x86（Shutdown + bit7），对齐新奇 NH17 文档 06->86->06 序列；
+ * 仅置 bit7 的 0x80 不被部分模组接受。
  */
 constexpr uint16_t CONTROL_WORD_SWITCH_ON = 0x06;
 constexpr uint16_t CONTROL_WORD_ENABLE_VOLTAGE = 0x07;
 constexpr uint16_t CONTROL_WORD_ENABLE_OPERATION = 0x0F;
 constexpr uint16_t CONTROL_WORD_KEEP_OPERATION = 0x1F;
-constexpr uint16_t CONTROL_WORD_FAULT_RESET = 0x80;
+constexpr uint16_t CONTROL_WORD_FAULT_RESET = 0x86;
 
 constexpr uint16_t kCia402EnableSequence[4] = {
     CONTROL_WORD_SWITCH_ON,

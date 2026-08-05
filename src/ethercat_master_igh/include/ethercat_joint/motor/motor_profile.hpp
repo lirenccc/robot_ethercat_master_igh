@@ -42,7 +42,7 @@ struct MotorProfile {
     double velocity_limit_deg_s = 246.0;
     uint32_t dc_shift_ns = 0;  ///< DC SYNC0 偏移，新奇模组建议 0
     uint32_t dc_sync0_ns = 0;  ///< DC SYNC0 周期（ns）；0→沿用 bus_cycle_us*1000。JMDT 需 2000000 (2ms)。
-    /** DC assign_activate 字（0x0000=关闭 DC, 0x0300=启用 SYNC0）。NH17 需 0x0000（free-run）。 */
+    /** DC AssignActivate 字（厂商特定；0x0000=关闭 DC）。NH17 用 0x0300（激活 SYNC0，IgH 标准 DC），模组文档要求激活 DC 后模式显示才会跟随。 */
     uint16_t dc_assign_activate = 0x0300;
     /** 启动时是否校验 0x60C2 与总线周期一致；无 0x60C2 的型号设 false */
     bool require_interpolation_period_gate = true;

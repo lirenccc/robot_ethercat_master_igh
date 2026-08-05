@@ -61,6 +61,7 @@ struct MotorStateData {
     int16_t actual_torque;
     int32_t sensor_force_2020;  // SJD17 减速器输出端力矩传感器 (TxPDO 0x2020)；未映射时为 0
     int32_t motor_encoder_2021;  // SJD17 电机端（减速器输入端）编码器 (TxPDO 0x2021)；未映射时为 0
+    uint16_t error_code;  // 驱动错误码 (0x603F)；未映射/无故障时为 0
     int16_t target_torque;
     
     int8_t operation_mode_display;  // 0x6061: 操作模式显示寄存器
@@ -479,6 +480,7 @@ private:
         unsigned int actual_torque;
         unsigned int sensor_force_2020;  // 0x2020；未映射时为 0
         unsigned int motor_encoder_2021;  // 0x2021；未映射时为 0
+        unsigned int error_code;          // 0x603F；未映射时为 kPdoOffsetUnset
         unsigned int digital_inputs;
         
         // ⭐ 网关相关 PDO 偏移量（CAN/CANFD/RS485）
@@ -596,6 +598,7 @@ private:
     // ========== PDO 缓存（RT 写 / ROS 读，经 seqlock 发布一致性快照） ==========
     std::vector<uint16_t> last_status_words_;         // 状态字 (0x6041)
     std::vector<int8_t> last_operation_mode_displays_; // 操作模式显示 (0x6061)
+    std::vector<uint16_t> last_error_codes_;          // 驱动错误码 (0x603F)
     std::vector<int32_t> last_actual_positions_;      // 实际位置 (0x6064)
     std::vector<int32_t> last_actual_velocities_;     // 实际速度 (0x606C)
     std::vector<int16_t> last_actual_torques_;        // 实际力矩 (0x6077)
@@ -650,4 +653,3 @@ private:
 } // namespace ethercat_joint
 
 #endif // ETHERCAT_SERVO_IGH_HPP
-

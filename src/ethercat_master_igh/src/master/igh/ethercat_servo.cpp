@@ -116,6 +116,10 @@ inline double rawTorqueToOutputTorque(int16_t torque_raw, size_t motor_id)
 
 bool uploadSdoUint32(ec_master_t* master, uint16_t slave_pos, uint16_t index, uint8_t subindex,
                        uint32_t& value);
+bool uploadSdoU8(ec_master_t* master, uint16_t slave_pos, uint16_t index, uint8_t subindex,
+                   uint8_t& value);
+bool downloadSdoU8(ec_master_t* master, uint16_t slave_pos, uint16_t index, uint8_t subindex,
+                   uint8_t value);
 
 }  // namespace
 
@@ -380,6 +384,7 @@ bool EtherCATServo::initialize(const std::vector<MotorConfig>& motor_configs)
     // ========== 初始化PDO数据低频缓存 ==========
     last_status_words_.resize(motor_count_, 0);
     last_operation_mode_displays_.resize(motor_count_, 0);
+    last_error_codes_.resize(motor_count_, 0);
     last_actual_positions_.resize(motor_count_, 0);
     last_actual_velocities_.resize(motor_count_, 0);
     last_actual_torques_.resize(motor_count_, 0);
@@ -552,13 +557,14 @@ bool EtherCATServo::dcSyncWarmup(uint32_t duration_ms)
         ecrt_domain_process(domain_out_);
         ecrt_domain_process(domain_in_);
 
-        // 2. 写安全 PDO 值 —— 控制字=0（不使能）、操作模式=CSP、目标=空闲位置
+        // 2. 写安全 PDO 值 —— 控制字=0x06 Shutdown（NH17 文档：进入 OP 前控制字不可为 0）、
+        //    操作模式=CSP、目标=空闲位置
         for (size_t i = 0; i < motor_count_; ++i) {
             const auto& offsets = pdo_offsets_[i];
             if (isGateway(motor_configs_[i])) {
                 continue;  // 网关跳过（无关节 PDO）
             }
-            EC_WRITE_U16(domain_out_pd_ + offsets.control_word, 0);
+            EC_WRITE_U16(domain_out_pd_ + offsets.control_word, CONTROL_WORD_SWITCH_ON);
             if (offsets.operation_mode != 0) {
                 EC_WRITE_S8(domain_out_pd_ + offsets.operation_mode, 8);  // CSP
             }
@@ -646,6 +652,7 @@ bool EtherCATServo::verifyPdoEvidence(size_t motor_id) const
     log_field("0x6041_status_word", off.status_word);
     log_field("0x6064_actual_position", off.actual_position);
     log_field("0x607A_target_position", off.target_position);
+    log_field("0x603F_error_code", off.error_code);
 
     if (off.status_word == kPdoOffsetUnset) {
         std::cerr << "[IgH] PDO_EVIDENCE axis=" << motor_id
@@ -705,31 +712,63 @@ bool EtherCATServo::verifyInterpolationPeriodGate()
         const uint16_t slave_pos = motor_configs_[i].position;
         uint32_t value_u = 0;
         uint32_t exp_u = 0;
-        const bool ok_v = uploadSdoUint32(master_, slave_pos, 0x60C2, 1, value_u);
-        const bool ok_e = uploadSdoUint32(master_, slave_pos, 0x60C2, 2, exp_u);
+        bool ok_v = uploadSdoUint32(master_, slave_pos, 0x60C2, 1, value_u);
+        bool ok_e = uploadSdoUint32(master_, slave_pos, 0x60C2, 2, exp_u);
+        uint8_t actual_value = 0;
+        uint8_t actual_exp = 0;
+        if (ok_v && ok_e) {
+            actual_value = static_cast<uint8_t>(value_u & 0xFFU);
+            actual_exp = static_cast<uint8_t>(exp_u & 0xFFU);
+        } else {
+            // 部分模组 0x60C2 为 U8（新奇 NH17 ENI 下载单字节）；按 U8 重试
+            ok_v = uploadSdoU8(master_, slave_pos, 0x60C2, 1, actual_value);
+            ok_e = uploadSdoU8(master_, slave_pos, 0x60C2, 2, actual_exp);
+        }
         if (!ok_v || !ok_e) {
             std::cerr << "[IgH] SDO_GATE axis=" << i
                       << " index=0x60C2 result=fail upload" << std::endl;
             return false;
         }
 
-        const uint8_t actual_value = static_cast<uint8_t>(value_u & 0xFFU);
-        const int8_t actual_exp = static_cast<int8_t>(exp_u & 0xFFU);
-        const bool match = interpolationPeriodMatchesBus(
-            actual_value, actual_exp, bus_cycle_ns);
+        const int8_t actual_exp_s = static_cast<int8_t>(actual_exp);
+        bool match = interpolationPeriodMatchesBus(
+            actual_value, actual_exp_s, bus_cycle_ns);
         std::cout << "[IgH] SDO_GATE axis=" << i
                   << " index=0x60C2 expected_value="
                   << static_cast<unsigned>(expected->value)
                   << " expected_exponent=" << static_cast<int>(expected->exponent)
                   << " actual_value=" << static_cast<unsigned>(actual_value)
-                  << " actual_exponent=" << static_cast<int>(actual_exp)
+                  << " actual_exponent=" << static_cast<int>(actual_exp_s)
                   << " bus_cycle_us=" << bus_cycle_us
                   << " match=" << (match ? 1 : 0) << std::endl;
         if (!match) {
-            std::cerr << "[IgH] SDO_GATE axis=" << i
-                      << " result=fail interpolation period mismatch"
-                      << " (read-only; not rewriting drive)" << std::endl;
-            return false;
+            // 不匹配时按 ENI 方式下载期望值（0x60C2:1=value、0x60C2:2=exponent，U8），再回读确认。
+            // 新奇 NH17 的 ENI 即通过 CoE 下载 0x60C2:1=4、0x60C2:2=-3。
+            const bool dl_v = downloadSdoU8(master_, slave_pos, 0x60C2, 1, expected->value);
+            const bool dl_e = downloadSdoU8(
+                master_, slave_pos, 0x60C2, 2,
+                static_cast<uint8_t>(expected->exponent));
+            std::cout << "[IgH] SDO_GATE axis=" << i
+                      << " index=0x60C2 download value=" << (dl_v ? "ok" : "fail")
+                      << " exponent=" << (dl_e ? "ok" : "fail") << std::endl;
+            if (!dl_v || !dl_e) {
+                std::cerr << "[IgH] SDO_GATE axis=" << i
+                          << " index=0x60C2 result=fail download" << std::endl;
+                return false;
+            }
+            uint8_t re_v = 0;
+            uint8_t re_e = 0;
+            const bool rv = uploadSdoU8(master_, slave_pos, 0x60C2, 1, re_v);
+            const bool re_ok = uploadSdoU8(master_, slave_pos, 0x60C2, 2, re_e);
+            match = rv && re_ok &&
+                re_v == expected->value &&
+                static_cast<int8_t>(re_e) == expected->exponent;
+            if (!match) {
+                std::cerr << "[IgH] SDO_GATE axis=" << i
+                          << " result=fail interpolation period mismatch after download"
+                          << std::endl;
+                return false;
+            }
         }
     }
     return true;
@@ -790,7 +829,7 @@ bool EtherCATServo::configurePDOMapping()
                                        cfg.product_code == kSjd17ProductCode);
             std::cout << "  ▶ " << (is_sjd17 ? "SJD17" : "Xinqi")
                       << " JOINT_MODULE PDO 0x1600/0x1A00"
-                      << (is_sjd17 ? " (14B Rx / 22B Tx + 0x2020/0x2021)" : " (14B/14B + gap)")
+                      << (is_sjd17 ? " (14B Rx / 22B Tx + 0x2020/0x2021)" : " (14B Rx / 16B Tx + 0x603F)")
                       << std::endl;
 
             static const ec_pdo_entry_info_t joint_rx_entries[] = {
@@ -801,13 +840,14 @@ bool EtherCATServo::configurePDOMapping()
                 {0x6060, 0x00, 8},
                 {0x0000, 0x00, 8},
             };
-            // 新奇：14B Tx（无 0x2020/0x2021）
+            // 新奇：16B Tx（0x6041/6064/606C/6077/6061/603F + Gap），含 0x603F 错误码
             static const ec_pdo_entry_info_t joint_tx_entries_xinqi[] = {
                 {0x6041, 0x00, 16},
                 {0x6064, 0x00, 32},
                 {0x606C, 0x00, 32},
                 {0x6077, 0x00, 16},
                 {0x6061, 0x00, 8},
+                {0x603F, 0x00, 16},
                 {0x0000, 0x00, 8},
             };
             // SJD17：22B Tx，含 0x2020 输出端力矩传感器 + 0x2021 电机端编码器
@@ -825,7 +865,7 @@ bool EtherCATServo::configurePDOMapping()
                 {0x1600, 6, joint_rx_entries},
             };
             static const ec_pdo_info_t joint_tx_pdos_xinqi[] = {
-                {0x1A00, 6, joint_tx_entries_xinqi},
+                {0x1A00, 7, joint_tx_entries_xinqi},
             };
             static const ec_pdo_info_t joint_tx_pdos_sjd17[] = {
                 {0x1A00, 8, joint_tx_entries_sjd17},
@@ -847,7 +887,7 @@ bool EtherCATServo::configurePDOMapping()
             if (is_sjd17) {
                 std::cout << "  ✓ TxPDO (0x1A00): 6041/6064/606C/6077/6061/2020/2021 + padding" << std::endl;
             } else {
-                std::cout << "  ✓ TxPDO (0x1A00): 6041/6064/606C/6077/6061 + padding" << std::endl;
+                std::cout << "  ✓ TxPDO (0x1A00): 6041/6064/606C/6077/6061/603F + padding" << std::endl;
             }
             continue;
         }
@@ -1734,8 +1774,13 @@ bool EtherCATServo::registerPDOEntries()
             } else {
                 offsets.sensor_force_2020 = 0;
                 offsets.motor_encoder_2021 = 0;
-                ret = ecrt_slave_config_reg_pdo_entry_pos(slave_configs_[i], 3, 0, 5, domain_in_, nullptr);
-                if (ret < 0) { std::cerr << tag << ": Failed to register Tx padding (SM3 entry 5)" << std::endl; return false; }
+                ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i], 0x603F, 0x00, domain_in_, nullptr);
+                if (ret < 0) { std::cerr << tag << ": Failed to register 0x603F" << std::endl; return false; }
+                offsets.error_code = ret;
+                std::cout << "  ✓ error_code (0x603F): offset=" << ret << std::endl;
+
+                ret = ecrt_slave_config_reg_pdo_entry_pos(slave_configs_[i], 3, 0, 6, domain_in_, nullptr);
+                if (ret < 0) { std::cerr << tag << ": Failed to register Tx padding (SM3 entry 6)" << std::endl; return false; }
                 offsets.padding_tx = ret;
                 std::cout << "  ✓ padding_tx (gap): offset=" << ret << std::endl;
             }
@@ -1747,6 +1792,7 @@ bool EtherCATServo::registerPDOEntries()
             std::cout << "  TxPDO offsets: sw=" << offsets.status_word
                       << " ap=" << offsets.actual_position << " av=" << offsets.actual_velocity
                       << " at=" << offsets.actual_torque << " od=" << offsets.operation_mode_display
+                      << " ec=" << offsets.error_code
                       << " sf=" << offsets.sensor_force_2020
                       << " me=" << offsets.motor_encoder_2021 << std::endl;
             if (!verifyPdoEvidence(i)) {
@@ -2090,6 +2136,11 @@ void EtherCATServo::receiveData()
             // 注意：这里只是内存拷贝，速度很快
             last_status_words_[i] = EC_READ_U16(domain_in_pd_ + offsets.status_word);
             last_operation_mode_displays_[i] = EC_READ_S8(domain_in_pd_ + offsets.operation_mode_display);
+            if (offsets.error_code != 0) {
+                last_error_codes_[i] = EC_READ_U16(domain_in_pd_ + offsets.error_code);
+            } else {
+                last_error_codes_[i] = 0;
+            }
             last_actual_positions_[i] = EC_READ_S32(domain_in_pd_ + offsets.actual_position);
             last_actual_velocities_[i] = EC_READ_S32(domain_in_pd_ + offsets.actual_velocity);
             last_actual_torques_[i] = EC_READ_S16(domain_in_pd_ + offsets.actual_torque);
@@ -2502,10 +2553,10 @@ void EtherCATServo::sendDataCommon(size_t i, const PDOOffsets& offsets)
     // 写入控制字到PDO
         EC_WRITE_U16(domain_out_pd_ + offsets.control_word, control_word_to_write);
         
-        // 更新最后写入的控制字
-        last_written_control_words_[i] = control_word_to_write;
+    // 更新最后写入的控制字
+    last_written_control_words_[i] = control_word_to_write;
 
-        if (runtime_logger_ && control_word_to_write != last_logged_control_words_[i]) {
+    if (runtime_logger_ && control_word_to_write != last_logged_control_words_[i]) {
             RuntimeLogEvent ev{};
             ev.timestamp_ns = getMonotonicTimeNs();
             ev.motor_id = static_cast<uint8_t>(i);
@@ -2626,6 +2677,22 @@ bool EtherCATServo::setEnable(uint8_t motor_id, bool enable)
     // Non-RT writer; Job TX path reads desired_enable_ / FSM without mutex.
     if (motor_id == 0xFF) {
         // Broadcast: all motors, skip gateway VID/PID.
+        bool any_change = false;
+        for (size_t i = 0; i < motor_count_; ++i) {
+            const auto& cfg = motor_configs_[i];
+            if (cfg.vendor_id == kGatewayVendorId && cfg.product_code == kGatewayProductCode) {
+                continue;
+            }
+            if (desired_enable_[i] != enable) {
+                any_change = true;
+                break;
+            }
+        }
+        // 幂等：desired_enable 未变化时直接返回，勿重置使能 FSM。
+        // Master::cycle 每拍都会调用 setEnable，无条件重置会让使能序列永远停在 0x06。
+        if (!any_change) {
+            return true;
+        }
         for (size_t i = 0; i < motor_count_; ++i) {
             const auto& cfg = motor_configs_[i];
             if (cfg.vendor_id == kGatewayVendorId && cfg.product_code == kGatewayProductCode) {
@@ -2637,6 +2704,10 @@ bool EtherCATServo::setEnable(uint8_t motor_id, bool enable)
             enable_fsm_wait_[i] = 0;
         }
     } else if (motor_id < motor_count_) {
+        // 幂等：同上；仅在使能状态变化时启动/重置 FSM
+        if (desired_enable_[motor_id] == enable) {
+            return true;
+        }
         desired_enable_[motor_id] = enable;
         enable_fsm_active_[motor_id] = true;
         enable_fsm_step_[motor_id] = 0;
@@ -3062,6 +3133,7 @@ std::vector<MotorStateData> EtherCATServo::getMotorStates() const
     std::vector<int16_t> torques(state_count);
     std::vector<int32_t> sensor_forces(state_count);
     std::vector<int32_t> motor_encoders(state_count);
+    std::vector<uint16_t> error_codes(state_count);
     std::vector<bool> enables(state_count);
 
     for (;;) {
@@ -3077,6 +3149,7 @@ std::vector<MotorStateData> EtherCATServo::getMotorStates() const
             torques[i] = last_actual_torques_[i];
             sensor_forces[i] = last_sensor_force_2020_[i];
             motor_encoders[i] = last_motor_encoder_2021_[i];
+            error_codes[i] = last_error_codes_[i];
             enables[i] = static_cast<bool>(enable_requested_[i]);
         }
         if (!pdo_cache_seq_.readRetry(s)) {
@@ -3107,6 +3180,7 @@ std::vector<MotorStateData> EtherCATServo::getMotorStates() const
         state.actual_torque = torques[i];
         state.sensor_force_2020 = sensor_forces[i];
         state.motor_encoder_2021 = motor_encoders[i];
+        state.error_code = error_codes[i];
         state.target_torque = target_torques_[i].load(std::memory_order_acquire);
         
         state.operation_mode_display = mode_displays[i];
@@ -3623,6 +3697,28 @@ bool uploadSdoUint32(ec_master_t* master, uint16_t slave_pos, uint16_t index, ui
         master, slave_pos, index, subindex,
         reinterpret_cast<uint8_t*>(&value), sizeof(value), &result_size, &abort_code);
     return ret == 0 && result_size == sizeof(value);
+}
+
+bool uploadSdoU8(ec_master_t* master, uint16_t slave_pos, uint16_t index, uint8_t subindex,
+                   uint8_t& value)
+{
+    value = 0;
+    size_t result_size = sizeof(value);
+    uint32_t abort_code = 0;
+    const int ret = ecrt_master_sdo_upload(
+        master, slave_pos, index, subindex,
+        reinterpret_cast<uint8_t*>(&value), sizeof(value), &result_size, &abort_code);
+    return ret == 0 && result_size == sizeof(value);
+}
+
+bool downloadSdoU8(ec_master_t* master, uint16_t slave_pos, uint16_t index, uint8_t subindex,
+                   uint8_t value)
+{
+    uint32_t abort_code = 0;
+    const int ret = ecrt_master_sdo_download(
+        master, slave_pos, index, subindex,
+        reinterpret_cast<const uint8_t*>(&value), sizeof(value), &abort_code);
+    return ret == 0;
 }
 
 }  // namespace

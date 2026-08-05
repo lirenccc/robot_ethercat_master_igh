@@ -226,10 +226,11 @@ bool Master::cycle(
       st.fault = true;
       if (i < motor_states.size()) {
         st.status_word = motor_states[i].status_word;
+        st.error_code = motor_states[i].error_code;
       } else {
         st.status_word = 0;
+        st.error_code = 0;
       }
-      st.error_code = 0;
     }
     error = "IgH communication fault (safe-output active)";
     return false;
@@ -284,12 +285,13 @@ bool Master::cycle(
       st.enabled = motor_states[i].enabled;
       st.fault = motor_states[i].fault;
       st.status_word = motor_states[i].status_word;
+      st.error_code = motor_states[i].error_code;
     } else {
       st.enabled = false;
       st.fault = false;
       st.status_word = 0;
+      st.error_code = 0;
     }
-    st.error_code = 0;
   }
 
   error.clear();

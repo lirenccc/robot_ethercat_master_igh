@@ -84,9 +84,10 @@ const std::vector<MotorProfile> kProfiles = {
         makeNh17Kinematics(),
         246.0,
         0U,
-        0U,
-        0x0000U, // dc_assign_activate: NH17 关闭 DC（free-run）
-        false,   // require_interpolation_period_gate: NH17 不支持 0x60C2 SDO
+        4000000U, // dc_sync0_ns: DC 周期 = 4ms（对齐 ENI CycleTime0/总线周期）
+        0x0300U,  // dc_assign_activate: 激活 SYNC0（IgH 标准 DC；0x0003 只分配周期不激活 SYNC，
+                  //   NH17 模式显示不跟随导致 od=0、拒绝进入 Operation Enabled）
+        true,     // require_interpolation_period_gate: ENI 经 SDO 下载 0x60C2:1=4、0x60C2:2=-3
     },
     {
         "SJD-17-120-NN-S00",

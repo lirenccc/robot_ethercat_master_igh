@@ -35,15 +35,17 @@ inline SafeProcessImageOutputs makeSafeProcessImageOutputs(int32_t actual_positi
 }
 
 /**
- * 显式 Fault Reset 只覆盖已选中且仍处于 Fault 的轴。
- * 非故障轴和复位窗口之外始终保持 Shutdown(0x06)。
+ * 显式 Fault Reset：复位窗口内对已选中轴写 fault_reset_cw（CiA402 bit7 上升沿）。
+ * 窗口外始终 Shutdown(0x06)。不按状态字再过滤，以便广播清 0xFF51 等已锁存故障。
+ * axis_faulted 保留形参以兼容调用点。
  */
 inline uint16_t selectSafeControlWord(bool reset_window_active,
                                       bool axis_selected,
-                                      bool axis_faulted) noexcept
+                                      bool /*axis_faulted*/,
+                                      uint16_t fault_reset_cw) noexcept
 {
-    return reset_window_active && axis_selected && axis_faulted
-        ? CONTROL_WORD_FAULT_RESET
+    return reset_window_active && axis_selected
+        ? fault_reset_cw
         : CONTROL_WORD_SWITCH_ON;
 }
 

@@ -99,8 +99,8 @@ private:
   static void timingThreadMain(IghMasterRuntime * self);
   static void jobThreadMain(IghMasterRuntime * self);
 
-  static constexpr int kTimingFifoPriority = 99;
-  static constexpr int kJobFifoPriority = 98;
+  static constexpr int kTimingFifoPriority = 98;
+  static constexpr int kJobFifoPriority = 99;  // 单 Job 线程时给最高 FIFO（无 Timing 抢核）
 
   IghMasterConfig config_{};
   EtherCATServo * servo_{nullptr};

@@ -154,6 +154,9 @@ public:
     int32_t lastDcDiffNs() const;
     bool isDcStatusValid() const;
 
+    /** 逻辑 wakeup → 含 DC PLL 漂移补偿的绝对睡眠时刻（Job 线程用） */
+    struct timespec getDcSleepSpec(uint64_t wakeup_time_ns) const;
+
     /** Job 线程每拍开头：外部命令新鲜度检查 */
     void checkExternalCommandFreshness();
     
@@ -228,7 +231,7 @@ public:
      * @brief 显式 CiA402 Fault Reset（须已在 safe-output 且轴失能）
      * @param motor_id 轴索引，0xFF=全体故障轴
      */
-    bool requestFaultReset(uint8_t motor_id) noexcept;
+    bool requestFaultReset(uint8_t motor_id, bool allow_without_fault = false) noexcept;
 
     /**
      * @brief 设置操作模式
@@ -399,6 +402,9 @@ public:
      * @return 如果所有从站都在OP状态则返回true
      */
     bool areAllSlavesInOP() const;
+
+    /** 诊断：打印每个从站 AL 状态与错误码（0x0134），用于定位进 OP 失败原因 */
+    void diagnoseSlaveAlStates() const;
     
     /**
      * @brief CIA402 状态机控制
@@ -599,6 +605,7 @@ private:
     std::vector<uint16_t> last_status_words_;         // 状态字 (0x6041)
     std::vector<int8_t> last_operation_mode_displays_; // 操作模式显示 (0x6061)
     std::vector<uint16_t> last_error_codes_;          // 驱动错误码 (0x603F)
+    std::vector<uint16_t> fault_reset_cw_;            // 每轴 Fault Reset 控制字（profile 化；默认 0x86）
     std::vector<int32_t> last_actual_positions_;      // 实际位置 (0x6064)
     std::vector<int32_t> last_actual_velocities_;     // 实际速度 (0x606C)
     std::vector<int16_t> last_actual_torques_;        // 实际力矩 (0x6077)

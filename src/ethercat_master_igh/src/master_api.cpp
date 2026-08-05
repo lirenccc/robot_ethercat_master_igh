@@ -7,6 +7,7 @@
 
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <iostream>
 #include <thread>
 
@@ -114,11 +115,10 @@ bool Master::start(std::string & error)
     return false;
   }
 
-  // DC 同步预热（activate 后、Job 前，对齐 EC-Master DCM BurstBulk + SettleTime）
-  // Bypassed for NH17: Job thread handles natural DC sync.
-  // Keeping call site for future re-enable.
-  // if (!servo_->dcSyncWarmup(5000)) { ... }
-  (void)servo_->dcSyncWarmup(5000);  // observation-only; don't gate
+  // DC 同步预热：天机 JMDT 在 Job 前 bootstrap 卡 PREOP（AL=0x2），5s 空转无益；
+  // PREOP→OP 交给 Job 周期（对齐天机 activate 后直接 cyclic）。
+  // NH17 等若需 Job 前 settle，可再按 profile 打开短 warmup。
+  (void)0;
 
   startup_evidence_passed_ = servo_->startupEvidencePassed();
   motion_commands_authorized_ = motionPolicyAuthorizesCommands(
@@ -151,30 +151,95 @@ bool Master::start(std::string & error)
       break;
     }
     const auto now = std::chrono::steady_clock::now();
-    if (now - last_log >= std::chrono::milliseconds(500)) {
+    if (now - last_log >= std::chrono::seconds(5)) {
       last_log = now;
       const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         now - (op_deadline - kOpWait)).count();
       const auto diag = ethercat_joint::IghMasterRuntime::instance().jobCycleDiag();
       std::cout << "[IgH] OP wait @" << elapsed_ms
-                << "ms after Job start (rx_ok=" << diag.last_rx_ok
-                << ")" << std::endl;
+                << "ms (rx_ok=" << diag.last_rx_ok
+                << " dc_dev=" << diag.dc_deviation_ns << ")" << std::endl;
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
   }
   if (!all_op) {
     error = "IgH slaves did not reach OP within 30s after Job start (WC/AL stuck)";
     std::cerr << "[IgH] " << error << std::endl;
+    servo_->diagnoseSlaveAlStates();
     ethercat_joint::IghMasterRuntime::instance().stop();
     servo_->deactivate();
     running_ = false;
     return false;
   }
-  std::cout << "[IgH] ✓ All slaves in OP after Job start" << std::endl;
-  ethercat_joint::IghMasterRuntime::instance().setOperational(true);
+  std::cout << "[IgH] All slaves in OP" << std::endl;
 
-  // 清除启动阶段的 safe-output latch：requestSafeOutput() 在 OP 前锁 comm_fault，
-  // 进 OP 后必须 reset 一次，让 healthy_dwell 重新评估。
+  // CoolDrive 在首批进 OP、DC 仍偏差数百 µs 时会锁存 0xFF51。先等 PLL 收敛，
+  // 再在 safe-output 下发 CiA402 Fault Reset(0x80)；此时尚不 setOperational，
+  // 避免 settle 窗口内的 dcOutOfSync 误闩锁。
+  {
+    constexpr auto kDcSettleTimeout = std::chrono::seconds(5);
+    constexpr int32_t kSettleAbsNs = 80000;  // 80 µs
+    constexpr int kGoodNeeded = 15;          // ~300 ms @ 20 ms poll
+    const auto deadline = std::chrono::steady_clock::now() + kDcSettleTimeout;
+    int good_streak = 0;
+    while (std::chrono::steady_clock::now() < deadline) {
+      const auto diag = ethercat_joint::IghMasterRuntime::instance().jobCycleDiag();
+      const bool settled = diag.dc_status_valid && diag.last_rx_ok != 0 &&
+        (std::llabs(static_cast<long long>(diag.dc_deviation_ns)) <= kSettleAbsNs);
+      if (settled) {
+        if (++good_streak >= kGoodNeeded) {
+          break;
+        }
+      } else {
+        good_streak = 0;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+  }
+
+  // 清软闩、保持 safe-output（clearCommFault 会重断言 safe_output_required）
+  servo_->requestSafetyReset();
+
+  uint16_t first_fault_ec = 0;
+  std::size_t fault_axes = 0;
+  for (std::size_t i = 0; i < axes_.size(); ++i) {
+    const uint16_t ec = servo_->readErrorCode(static_cast<uint8_t>(i));
+    if (ec != 0U) {
+      ++fault_axes;
+      if (first_fault_ec == 0U) {
+        first_fault_ec = ec;
+      }
+    }
+  }
+
+  if (fault_axes > 0U) {
+    // JMDT TxPDO 无 0x603F；以 SDO 为准强制装载 0x80 窗口。
+    if (!servo_->requestFaultReset(0xFFU, /*allow_without_fault=*/true)) {
+      std::cerr << "[IgH] startup Fault Reset arm failed "
+                << "(safe-output/OP/disable gate), axes_with_ec=" << fault_axes
+                << " first=0x" << std::hex << first_fault_ec << std::dec << std::endl;
+    } else {
+      std::this_thread::sleep_for(std::chrono::milliseconds(80));  // >20×2ms
+      std::size_t remaining = 0;
+      for (std::size_t i = 0; i < axes_.size(); ++i) {
+        if (servo_->readErrorCode(static_cast<uint8_t>(i)) != 0U) {
+          ++remaining;
+        }
+      }
+      if (remaining == 0U) {
+        std::cout << "[IgH] startup Fault Reset cleared " << fault_axes
+                  << " axes (was 0x" << std::hex << first_fault_ec << std::dec
+                  << ")" << std::endl;
+      } else {
+        std::cerr << "[IgH] startup Fault Reset incomplete: " << remaining
+                  << "/" << fault_axes << " still non-zero (was 0x"
+                  << std::hex << first_fault_ec << std::dec << ")" << std::endl;
+      }
+    }
+  }
+
+  ethercat_joint::IghMasterRuntime::instance().setOperational(true);
+  // 武装 anomaly 后再 reset 一次，让 healthy_dwell 从干净状态计时
   servo_->requestSafetyReset();
 
   const auto n = axes_.size();

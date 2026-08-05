@@ -46,6 +46,8 @@ struct MotorProfile {
     uint16_t dc_assign_activate = 0x0300;
     /** 启动时是否校验 0x60C2 与总线周期一致；无 0x60C2 的型号设 false */
     bool require_interpolation_period_gate = true;
+    /** CiA402 Fault Reset 控制字。0x86（Shutdown+bit7）用于新奇/三木禾；天机需纯 0x80。 */
+    uint16_t fault_reset_control_word = 0x86;
 };
 
 class MotorProfileRegistry {

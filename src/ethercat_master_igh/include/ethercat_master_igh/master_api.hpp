@@ -180,8 +180,8 @@ public:
    */
   bool request_safety_reset(std::string & error);
   /**
-   * Explicit disabled-state CiA402 Fault Reset.
-   * Not implemented on IgH yet; always returns false.
+   * Explicit disabled-state CiA402 Fault Reset (profile control word, JMDT=0x80).
+   * Requires Job OP + safe-output + all axes disabled.
    */
   bool request_fault_reset(uint8_t axis_id) noexcept;
   void request_safe_output() noexcept;

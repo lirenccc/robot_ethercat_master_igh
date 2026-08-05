@@ -127,10 +127,12 @@ const std::vector<MotorProfile> kProfiles = {
         PdoLayout::COOLDRIVE_JMDT,
         makeJmdtKinematics(),
         180.0,
-        720000U,  // dc_shift_ns: SYNC0 shift ≈ 720 µs（天机 Marvin 对齐值）
-        2000000U, // dc_sync0_ns: DC SYNC0 周期 = 2ms（天机 Marvin 成功值）
-        0x0000U,  // dc_assign_activate: 当前 free-run（关闭 DC）；需 DC 时改 0x0300
-        false,    // require_interpolation_period_gate: JMDT 不做 0x60C2 校验
+        720000U,  // dc_shift_ns: SM2 提前 SYNC0 720µs（天机文档：SM2 须比 DC 同步信号至少提前 125µs，
+                  //   否则报 0xFF51 EtherCAT/DC 同步机制不匹配）
+        2000000U, // dc_sync0_ns: DC SYNC0 周期 = 2ms（参考实现实测驱动天机；4ms 报 0xFF51）
+        0x0300U,  // dc_assign_activate: 激活 SYNC0（参考实现实测值；2ms 周期下无需周期分配位）
+        true,     // require_interpolation_period_gate: 校验/下载 0x60C2 对齐 2ms 总线（尝试解决 0xFF51）
+        0x80,     // fault_reset_control_word: 天机需纯 0x80（0x86 不被接受，0xFF51 Fault 清不掉）
     },
 };
 

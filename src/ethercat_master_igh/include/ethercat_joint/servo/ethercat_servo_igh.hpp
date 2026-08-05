@@ -111,14 +111,25 @@ public:
     bool activate();
     
     /**
+     * @brief DC 同步预热（activate 后、Job 前）：密集发送 DC 校准帧让从站 PLL 锁定。
+     * @param duration_ms 预热持续时间（毫秒），默认 3000ms。
+     * @return 从站 DC 是否锁定（至少一个从站进入 SAFEOP/OP）。
+     * @details 对应 EC-Master DCM BurstBulk + SettleTime 阶段。JMDT 电机 PLL
+     *          需连续多周期参考时钟帧才能锁定；不预热则 SAFEOP 立即报 PLL error。
+     */
+    bool dcSyncWarmup(uint32_t duration_ms = 3000);
+    
+    /**
      * @brief 停用主站（停止实时通信 / Job）
      */
     void deactivate();
 
     /**
-     * @brief Job 线程一拍：RX → DC sync → (safe|TX)。返回本拍 domain WC 是否完整。
+     * @brief Job 线程一拍（对齐天机）：setAppTime → RX → DC sync → (safe|TX)。
+     * @param app_time_ns Timing 发布的逻辑唤醒时刻（ns）；0 则回退到单调时钟。
+     * @return 本拍 domain WC 是否完整
      */
-    bool runJobCycle(bool force_safe_output);
+    bool runJobCycle(bool force_safe_output, uint64_t app_time_ns = 0);
 
     bool isJobThreadRunning() const;
     uint32_t busCycleUs() const;
@@ -429,15 +440,19 @@ private:
     std::string operationModeToString(OperationMode mode) const;
     OperationMode stringToOperationMode(const std::string& mode_str) const;
 
-    // EtherCAT 对象
+    // EtherCAT 对象（双域：out=LWR / in=LRD，CoolDrive notLRW 不能用单域 LRW）
     unsigned int master_index_;
     ec_master_t* master_;
-    ec_domain_t* domain_;
-    uint8_t* domain_pd_;
+    ec_domain_t* domain_out_;
+    ec_domain_t* domain_in_;
+    uint8_t* domain_out_pd_;
+    uint8_t* domain_in_pd_;
     
     // 状态变量
     ec_master_state_t master_state_;
     ec_domain_state_t domain_state_;
+    ec_domain_state_t domain_out_state_;
+    ec_domain_state_t domain_in_state_;
     
     // 从站配置
     size_t motor_count_;

@@ -84,7 +84,9 @@ const std::vector<MotorProfile> kProfiles = {
         makeNh17Kinematics(),
         246.0,
         0U,
-        true,
+        0U,
+        0x0000U, // dc_assign_activate: NH17 关闭 DC（free-run）
+        false,   // require_interpolation_period_gate: NH17 不支持 0x60C2 SDO
     },
     {
         "SJD-17-120-NN-S00",
@@ -96,7 +98,9 @@ const std::vector<MotorProfile> kProfiles = {
         makeSjd17Kinematics(),
         225.0,
         0U,
-        false,
+        0U,
+        0x0000U, // dc_assign_activate: SJD 默认关 DC（free-run）
+        false,   // require_interpolation_period_gate: SJD 无 0x60C2 支持
     },
     {
         "PMSLM-LINEAR",
@@ -108,7 +112,9 @@ const std::vector<MotorProfile> kProfiles = {
         makePmslmLinearKinematics(),
         500.0,
         0U,
-        true,
+        0U,
+        0x0000U, // dc_assign_activate: 默认关 DC（free-run）
+        true,    // require_interpolation_period_gate: PMSLM 支持 0x60C2
     },
     {
         "COOLDRIVE-JMDT",
@@ -119,8 +125,10 @@ const std::vector<MotorProfile> kProfiles = {
         PdoLayout::COOLDRIVE_JMDT,
         makeJmdtKinematics(),
         180.0,
-        0U,
-        false,
+        720000U,  // dc_shift_ns: SYNC0 shift ≈ 720 µs（天机 Marvin 对齐值）
+        2000000U, // dc_sync0_ns: DC SYNC0 周期 = 2ms（天机 Marvin 成功值）
+        0x0000U,  // dc_assign_activate: 当前 free-run（关闭 DC）；需 DC 时改 0x0300
+        false,    // require_interpolation_period_gate: JMDT 不做 0x60C2 校验
     },
 };
 

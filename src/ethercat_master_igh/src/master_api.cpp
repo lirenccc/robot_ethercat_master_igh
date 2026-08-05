@@ -5,7 +5,10 @@
 #include "ethercat_joint/servo/cia402.hpp"
 #include "ethercat_joint/servo/ethercat_servo.hpp"
 
+#include <chrono>
 #include <cmath>
+#include <iostream>
+#include <thread>
 
 namespace ethercat_master_igh
 {
@@ -100,12 +103,23 @@ bool Master::start(std::string & error)
     error = "start: call map_joints first";
     return false;
   }
-  if (!servo_->activate()) {
-    error = "IgH EtherCATServo::activate failed";
-    return false;
-  }
+  // IgH: blocking mailbox SDO must run before ecrt_master_activate(). After activate,
+  // SDO without a running cyclic Job can hang indefinitely (ecrt_master_sdo_upload).
   (void)servo_->tryLoadKinematicsFromSdo();
   (void)servo_->initializePositionsFromSDO();
+  // 对齐天机：activate 只点着主站 + domain_pd；PREOP→OP 交给 Job 周期。
+  if (!servo_->activate()) {
+    error = "IgH EtherCATServo::activate failed (master/domain)";
+    running_ = false;
+    return false;
+  }
+
+  // DC 同步预热（activate 后、Job 前，对齐 EC-Master DCM BurstBulk + SettleTime）
+  // Bypassed for NH17: Job thread handles natural DC sync.
+  // Keeping call site for future re-enable.
+  // if (!servo_->dcSyncWarmup(5000)) { ... }
+  (void)servo_->dcSyncWarmup(5000);  // observation-only; don't gate
+
   startup_evidence_passed_ = servo_->startupEvidencePassed();
   motion_commands_authorized_ = motionPolicyAuthorizesCommands(
     motion_policy_, startup_evidence_passed_);
@@ -125,6 +139,43 @@ bool Master::start(std::string & error)
     servo_->deactivate();
     return false;
   }
+
+  // Job 已跑：等关节进 OP（WC 完整）。超时再 fail-closed。
+  constexpr auto kOpWait = std::chrono::seconds(60);  // extended for NH17 DC lock
+  const auto op_deadline = std::chrono::steady_clock::now() + kOpWait;
+  auto last_log = std::chrono::steady_clock::now();
+  bool all_op = false;
+  while (std::chrono::steady_clock::now() < op_deadline) {
+    all_op = servo_->areAllSlavesInOP();
+    if (all_op) {
+      break;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last_log >= std::chrono::milliseconds(500)) {
+      last_log = now;
+      const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now - (op_deadline - kOpWait)).count();
+      const auto diag = ethercat_joint::IghMasterRuntime::instance().jobCycleDiag();
+      std::cout << "[IgH] OP wait @" << elapsed_ms
+                << "ms after Job start (rx_ok=" << diag.last_rx_ok
+                << ")" << std::endl;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+  if (!all_op) {
+    error = "IgH slaves did not reach OP within 30s after Job start (WC/AL stuck)";
+    std::cerr << "[IgH] " << error << std::endl;
+    ethercat_joint::IghMasterRuntime::instance().stop();
+    servo_->deactivate();
+    running_ = false;
+    return false;
+  }
+  std::cout << "[IgH] ✓ All slaves in OP after Job start" << std::endl;
+  ethercat_joint::IghMasterRuntime::instance().setOperational(true);
+
+  // 清除启动阶段的 safe-output latch：requestSafeOutput() 在 OP 前锁 comm_fault，
+  // 进 OP 后必须 reset 一次，让 healthy_dwell 重新评估。
+  servo_->requestSafetyReset();
 
   const auto n = axes_.size();
   if (motion_commands_authorized_) {

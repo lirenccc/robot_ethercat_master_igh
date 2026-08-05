@@ -159,9 +159,9 @@ void IghMasterRuntime::clearCommFault()
 void IghMasterRuntime::requestSafeOutput()
 {
   const bool already = safe_output_required_.exchange(true, std::memory_order_acq_rel);
-  motion_reenable_allowed_.store(false, std::memory_order_release);
   if (!already) {
     // 上升沿：禁止使能直至 /request_safety_reset 重计 healthy dwell
+    motion_reenable_allowed_.store(false, std::memory_order_release);
     // 已在 safe 时勿再 onFault，否则会打断 clearCommFault 后的 dwell 计数
     healthy_dwell_.onFault();
   }
@@ -313,7 +313,8 @@ void IghMasterRuntime::jobThreadMain(IghMasterRuntime * self)
     }
 
     const bool armed = self->operational_.load(std::memory_order_acquire);
-    const bool rx_ok = servo->runJobCycle(self->safeOutputRequired());
+    // 用 Timing 逻辑唤醒时刻作 ecrt_master_application_time（对齐天机 wakeup_time）
+    const bool rx_ok = servo->runJobCycle(self->safeOutputRequired(), scheduled);
     self->last_rx_ok_.store(rx_ok, std::memory_order_relaxed);
 
     if (armed && !self->commFault()) {
@@ -333,7 +334,7 @@ void IghMasterRuntime::jobThreadMain(IghMasterRuntime * self)
     self->diag_deadline_miss_.store(self->timing_stats_.deadline_miss_count, std::memory_order_relaxed);
     self->diag_deadline_met_.store(self->timing_stats_.deadline_met, std::memory_order_relaxed);
 
-    if (armed && !self->commFault()) {
+    if (armed && !self->commFault() && self->config_.require_realtime) {
       const auto dl = self->deadline_tracker_.observe(!self->timing_stats_.deadline_met);
       if (dl.stop_required) {
         self->latchCommFault();
@@ -342,8 +343,9 @@ void IghMasterRuntime::jobThreadMain(IghMasterRuntime * self)
 
     self->sampleDcMonitor(servo);
 
-    // Dwell 只看通信是否可用；deadline/DC 抖动由 anomaly tracker 闩锁，不阻塞再使能计数。
-    const bool healthy = rx_ok && !self->commFault();
+    // Dwell 仅看 comm_fault；WC 间歇抖动已由 anomaly tracker 独立把关。
+    // rx_ok 不参与 dwell 计数，避免 NH17 free-run 下间歇 SM watchdog 反复清零。
+    const bool healthy = !self->commFault();
     self->healthy_dwell_.observe(healthy);
     self->syncMotionReenableFlag();
 
@@ -380,7 +382,8 @@ bool IghMasterRuntime::start(EtherCATServo * servo)
   }
 
   servo_ = servo;
-  operational_.store(true, std::memory_order_release);
+  // Bring-up：等 OP 完成前不武装 anomaly tracker，避免 WC=0 误闩锁
+  operational_.store(false, std::memory_order_release);
   comm_fault_.store(false, std::memory_order_release);
   healthy_dwell_.reset(config_.healthy_dwell_cycles);
   if (safe_output_required_.load(std::memory_order_acquire)) {

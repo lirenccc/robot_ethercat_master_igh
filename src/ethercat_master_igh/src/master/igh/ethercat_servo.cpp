@@ -35,10 +35,12 @@ constexpr uint32_t kGatewayProductCode = 0x01300060;
 constexpr uint32_t kSjd17VendorId = 0x000009CF;
 constexpr uint32_t kSjd17ProductCode = 0x00010001;
 
-constexpr uint64_t kActivateCycleNs = 1000000ULL;
-
 uint16_t g_send_data_wc = 0;
 uint8_t g_send_data_wc_state = 0;
+
+// Dual-domain: first PDO in each domain legitimately has byte offset 0.
+// Use UINT_MAX as "not registered"; never treat 0 as missing.
+constexpr unsigned int kPdoOffsetUnset = UINT_MAX;
 
 inline bool isJointModuleMotor(const MotorConfig& cfg)
 {
@@ -48,6 +50,48 @@ inline bool isJointModuleMotor(const MotorConfig& cfg)
 inline bool isCoolDriveJmdtMotor(const MotorConfig& cfg)
 {
     return cfg.pdo_layout == PdoLayout::COOLDRIVE_JMDT;
+}
+
+const MotorProfile * resolveMotorProfile(const MotorConfig & cfg)
+{
+    if (!cfg.model_id.empty()) {
+        if (const MotorProfile * p = MotorProfileRegistry::findByModelId(cfg.model_id)) {
+            return p;
+        }
+    }
+    return MotorProfileRegistry::findByIdentity(cfg.vendor_id, cfg.product_code);
+}
+
+/** SYNC0 shift：优先 motor_profile.dc_shift_ns（JMDT=720µs 对齐天机 IgH；JOINT 默认 0）。 */
+uint32_t resolveDcShiftNs(const MotorConfig & cfg)
+{
+    if (const MotorProfile * profile = resolveMotorProfile(cfg)) {
+        return profile->dc_shift_ns;
+    }
+    if (isJointModuleMotor(cfg) || isCoolDriveJmdtMotor(cfg)) {
+        return 0U;
+    }
+    return 100000U;
+}
+
+/** DC assign_activate（0x0300=启用 SYNC0；0x0000=关闭 DC）。优先 motor_profile.dc_assign_activate。 */
+uint16_t resolveDcAssignActivate(const MotorConfig & cfg)
+{
+    if (const MotorProfile * profile = resolveMotorProfile(cfg)) {
+        return profile->dc_assign_activate;
+    }
+    return 0x0300U;
+}
+
+/** SYNC0 周期（ns）：优先 motor_profile.dc_sync0_ns（JMDT=2ms）；0 → 沿用总线周期。 */
+uint32_t resolveDcSync0Ns(const MotorConfig & cfg, uint32_t bus_cycle_ns)
+{
+    if (const MotorProfile * profile = resolveMotorProfile(cfg)) {
+        if (profile->dc_sync0_ns > 0U) {
+            return profile->dc_sync0_ns;
+        }
+    }
+    return bus_cycle_ns;
 }
 
 inline bool isGateway(const MotorConfig& cfg)
@@ -70,15 +114,6 @@ inline double rawTorqueToOutputTorque(int16_t torque_raw, size_t motor_id)
     return MotorKinematics::rawTorqueToOutputTorque(torque_raw, motor_id);
 }
 
-void advanceMonotonicTimespec(struct timespec& ts, uint64_t delta_ns)
-{
-    ts.tv_nsec += static_cast<long>(delta_ns);
-    while (ts.tv_nsec >= 1000000000L) {
-        ts.tv_nsec -= 1000000000L;
-        ++ts.tv_sec;
-    }
-}
-
 bool uploadSdoUint32(ec_master_t* master, uint16_t slave_pos, uint16_t index, uint8_t subindex,
                        uint32_t& value);
 
@@ -87,8 +122,10 @@ bool uploadSdoUint32(ec_master_t* master, uint16_t slave_pos, uint16_t index, ui
 EtherCATServo::EtherCATServo(unsigned int master_index)
     : master_index_(master_index)
     , master_(nullptr)
-    , domain_(nullptr)
-    , domain_pd_(nullptr)
+    , domain_out_(nullptr)
+    , domain_in_(nullptr)
+    , domain_out_pd_(nullptr)
+    , domain_in_pd_(nullptr)
     , motor_count_(0)
     , position_filter_size_(3)  // 默认3点滤波（延迟125us）
     , initialized_(false)
@@ -97,6 +134,8 @@ EtherCATServo::EtherCATServo(unsigned int master_index)
     sync_handler_ = std::make_shared<EtherCATSync>();
     memset(&master_state_, 0, sizeof(master_state_));
     memset(&domain_state_, 0, sizeof(domain_state_));
+    memset(&domain_out_state_, 0, sizeof(domain_out_state_));
+    memset(&domain_in_state_, 0, sizeof(domain_in_state_));
 }
 
 EtherCATServo::~EtherCATServo()
@@ -153,13 +192,19 @@ bool EtherCATServo::initialize(const std::vector<MotorConfig>& motor_configs)
         return false;
     }
     
-    // 创建域
-    std::cout << "Creating domain..." << std::endl;
-    domain_ = ecrt_master_create_domain(master_);
-    if (!domain_) {
-        std::cerr << "Failed to create domain!" << std::endl;
+    // 双域：输出 LWR + 输入 LRD（CoolDrive Enable notLRW → 单域会合成 LRW → WC=0）
+    std::cout << "Creating dual domains (out/in)..." << std::endl;
+    domain_out_ = ecrt_master_create_domain(master_);
+    if (!domain_out_) {
+        std::cerr << "Failed to create output domain!" << std::endl;
         return false;
     }
+    domain_in_ = ecrt_master_create_domain(master_);
+    if (!domain_in_) {
+        std::cerr << "Failed to create input domain!" << std::endl;
+        return false;
+    }
+    std::cout << "[IgH] dual domains (out=LWR, in=LRD) for notLRW slaves" << std::endl;
 
     // 初始化同步模块（周期与 IGH_BUS_CYCLE_US 一致）
     if (sync_handler_ && master_) {
@@ -227,12 +272,18 @@ bool EtherCATServo::initialize(const std::vector<MotorConfig>& motor_configs)
             ref_slave_index = i;
         }
         
-        // 配置分布式时钟（DC）——包括网关在内的所有从站
-        // SYNC0 周期 1ms；新奇关节模组 shift=0（部分固件对 100us 偏移敏感）
+        // DC：SYNC0 周期优先 motor_profile.dc_sync0_ns（JMDT 需 2ms），否则沿用总线周期。
+        // shift 来自 motor_profile.dc_shift_ns（JMDT=720µs 对齐天机 IgH）。
         std::cout << "Configuring DC for " << device_type << " " << i << "..." << std::endl;
-        const uint32_t dc_shift_ns = is_joint_module ? 0U : 100000U;
-        ecrt_slave_config_dc(slave_configs_[i], 0x0300, 1000000, dc_shift_ns, 0, 0);
-        std::cout << "  ✓ DC configured: SYNC0=1ms, shift=" << (dc_shift_ns / 1000) << "us" << std::endl;
+        const uint32_t bus_cycle_ns =
+            (cached_bus_cycle_us_ > 0U ? cached_bus_cycle_us_ : 1000U) * 1000U;
+        const uint32_t sync0_ns = resolveDcSync0Ns(cfg, bus_cycle_ns);
+        const uint32_t dc_shift_ns = resolveDcShiftNs(cfg);
+        const uint16_t dc_assign = resolveDcAssignActivate(cfg);
+        ecrt_slave_config_dc(slave_configs_[i], dc_assign, sync0_ns, dc_shift_ns, 0, 0);
+        std::cout << "  ✓ DC configured: assign=0x" << std::hex << dc_assign << std::dec
+                  << " SYNC0=" << (sync0_ns / 1000) << "us, shift="
+                  << (dc_shift_ns / 1000) << "us" << std::endl;
     }
 
     // 选择参考时钟：以第一个从站作为参考时钟（进入OP前调用）
@@ -403,128 +454,166 @@ bool EtherCATServo::activate()
     }
     
     if (activated_) {
-        std::cout << "EtherCAT Servo already activated (by SDO initialization), skipping activation..." << std::endl;
-        // 已经激活，直接返回成功
+        std::cout << "EtherCAT Servo already activated, skipping activation..." << std::endl;
         return true;
     }
-    
+
+    // 0x60C2 mailbox SDO while still PREOP — must not run after activate without Job.
+    const bool sdo_gate_ok = verifyInterpolationPeriodGate();
+
     std::cout << "Activating master..." << std::endl;
     if (ecrt_master_activate(master_)) {
         std::cerr << "Failed to activate master!" << std::endl;
         return false;
     }
 
-    domain_pd_ = ecrt_domain_data(domain_);
-    if (!domain_pd_) {
-        std::cerr << "Failed to get domain data!" << std::endl;
+    // 对齐天机：activate 后立刻 send 一次；进 OP 交给后续 Job 周期。
+    ecrt_master_send(master_);
+
+    domain_out_pd_ = ecrt_domain_data(domain_out_);
+    if (!domain_out_pd_) {
+        std::cerr << "Failed to get output domain data!" << std::endl;
+        return false;
+    }
+    domain_in_pd_ = ecrt_domain_data(domain_in_);
+    if (!domain_in_pd_) {
+        std::cerr << "Failed to get input domain data!" << std::endl;
         return false;
     }
 
-    // ⭐ 确保所有从站的状态变量都初始化（包括网关）
     for (size_t i = 0; i < motor_count_; ++i) {
-        const auto& cfg = motor_configs_[i];
-        bool is_gateway = (cfg.vendor_id == kGatewayVendorId && cfg.product_code == kGatewayProductCode);
-
         enable_requested_[i] = false;
         control_word_states_[i].store(CONTROL_WORD_SWITCH_ON, std::memory_order_relaxed);
-        (void)is_gateway;
     }
 
     activated_ = true;
 
-    // 激活后按 1ms 节拍交换 PDO + DC 同步帧，推动 PREOP→SAFEOP→OP
-    // 注意：不可无间隔连续 send，否则会破坏 DC 同步并导致从站掉线
-    std::cout << "Bootstrap PDO exchange after activate (1ms cycle)..." << std::endl;
-    struct timespec wake{};
-    clock_gettime(CLOCK_MONOTONIC, &wake);
-    uint64_t app_time = sync_handler_ ? sync_handler_->getMonotonicTime() : 0;
-
-    constexpr int kMaxActivateCycles = 5000;
-    bool all_in_op = false;
-    for (int cycle = 0; cycle < kMaxActivateCycles; ++cycle) {
-        advanceMonotonicTimespec(wake, kActivateCycleNs);
-        clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &wake, nullptr);
-
-        ecrt_master_receive(master_);
-        ecrt_domain_process(domain_);
-        if (sync_handler_) {
-            app_time += kActivateCycleNs;
-            setApplicationTime(app_time);
-            processSync(app_time);
-        }
-        sendData();
-
-        if (cycle == 499 && motor_count_ > 0 && slave_configs_[0]) {
-            ec_slave_config_state_t boot_sc{};
-            ecrt_slave_config_state(slave_configs_[0], &boot_sc);
-            ec_domain_state_t boot_ds{};
-            ecrt_domain_state(domain_, &boot_ds);
-            std::cout << "  Bootstrap @500ms: WC=" << boot_ds.working_counter
-                      << " AL=0x" << std::hex << static_cast<int>(boot_sc.al_state)
-                      << std::dec << " online=" << boot_sc.online << std::endl;
-        }
-
-        all_in_op = true;
-        for (size_t i = 0; i < motor_count_; ++i) {
-            if (!slave_configs_[i]) {
-                all_in_op = false;
-                break;
-            }
-            ec_slave_config_state_t sc{};
-            ecrt_slave_config_state(slave_configs_[i], &sc);
-            if (sc.al_state != EC_AL_STATE_OP) {
-                all_in_op = false;
-                break;
-            }
-        }
-        if (all_in_op) {
-            ec_domain_state_t ds{};
-            ecrt_domain_state(domain_, &ds);
-            std::cout << "✓ All slaves in OP after " << (cycle + 1)
-                      << " ms (WC=" << ds.working_counter << ")" << std::endl;
-            break;
-        }
-
-        // 每 500ms 打印一次进度
-        if (cycle > 0 && cycle % 500 == 499 && motor_count_ > 0 && slave_configs_[0]) {
-            ec_domain_state_t ds{};
-            ecrt_domain_state(domain_, &ds);
-            ec_slave_config_state_t sc{};
-            ecrt_slave_config_state(slave_configs_[0], &sc);
-            std::cout << "  OP wait @" << (cycle + 1) << "ms: WC=" << ds.working_counter
-                      << " AL=0x" << std::hex << static_cast<int>(sc.al_state)
-                      << std::dec << " online=" << sc.online << std::endl;
-        }
-    }
-
-    if (!all_in_op && motor_count_ > 0 && slave_configs_[0]) {
-        ec_domain_state_t ds{};
-        ecrt_domain_state(domain_, &ds);
-        ec_slave_config_state_t sc{};
-        ecrt_slave_config_state(slave_configs_[0], &sc);
-        std::cerr << "⚠ Timeout waiting for OP: WC=" << ds.working_counter
-                  << " AL=0x" << std::hex << static_cast<int>(sc.al_state)
-                  << std::dec << " online=" << sc.online
-                  << " — cyclic task will keep trying" << std::endl;
-    }
-
     std::cout << "EtherCAT Servo activated successfully." << std::endl;
-    std::cout << "✓ Cyclic loop will handle all PDO communication" << std::endl;
-    std::cout << "✓ Domain process data size: " << ecrt_domain_size(domain_) << " bytes" << std::endl;
-    
-    // 检查主站状态
+    std::cout << "✓ Cyclic Job will drive PREOP→SAFEOP→OP (Tianji-aligned activate)" << std::endl;
+    std::cout << "✓ Domain out PD size: " << ecrt_domain_size(domain_out_) << " bytes" << std::endl;
+    std::cout << "✓ Domain in  PD size: " << ecrt_domain_size(domain_in_) << " bytes" << std::endl;
+
     ec_master_state_t ms;
     ecrt_master_state(master_, &ms);
     std::cout << "Master state:" << std::endl;
     std::cout << "  - Slaves responding: " << ms.slaves_responding << std::endl;
     std::cout << "  - AL states: 0x" << std::hex << (int)ms.al_states << std::dec << std::endl;
     std::cout << "  - Link up: " << (ms.link_up ? "yes" : "no") << std::endl;
-    
     master_state_ = ms;
 
-    (void)runStartupEvidenceGate();
+    // PDO registration evidence only (offsets). Interpolation SDO already ran pre-activate.
+    bool pdo_ok = true;
+    for (size_t i = 0; i < motor_count_; ++i) {
+        if (!verifyPdoEvidence(i)) {
+            pdo_ok = false;
+            break;
+        }
+    }
+    startup_evidence_passed_ = sdo_gate_ok && pdo_ok;
+    if (startup_evidence_passed_) {
+        std::cout << "[IgH] startup evidence gate PASSED" << std::endl;
+    } else {
+        std::cerr << "[IgH] startup evidence gate FAILED"
+                  << " (sdo=" << (sdo_gate_ok ? 1 : 0)
+                  << " pdo=" << (pdo_ok ? 1 : 0)
+                  << ") → observation-only" << std::endl;
+    }
 
     return true;
+}
+
+
+bool EtherCATServo::dcSyncWarmup(uint32_t duration_ms)
+{
+    if (!initialized_ || !master_ || !domain_out_pd_ || !domain_in_pd_) {
+        return false;
+    }
+
+    const uint32_t cycle_us =
+        cached_bus_cycle_us_ > 0U ? cached_bus_cycle_us_ : 1000U;
+    const uint32_t cycle_ns = cycle_us * 1000U;
+    const uint32_t settle_cycles =
+        duration_ms > 0U ? (duration_ms * 1000U / cycle_us) : 1U;
+
+    std::cout << "[IgH] DC+PDO bootstrap start ("
+              << settle_cycles << " cycles × " << cycle_us
+              << " µs = ~" << duration_ms << " ms)..." << std::endl;
+
+    // Bootstrap PDO+DC 循环：对齐 robotic-joint-control activate。
+    // 从站 PREOP→SAFEOP→OP 需要同时接收 PDO 数据和 DC sync 帧，
+    // 否则 SM watchdog (0x001B) 或 PLL error (0x0032) 导致状态转换失败。
+    // 不调用 sendData()（会跑 CiA402 FSM），直接写安全 PDO 值。
+    uint64_t app_time = sync_handler_ ? sync_handler_->getMonotonicTime() : getMonotonicTimeNs();
+    for (uint32_t n = 0; n < settle_cycles; ++n) {
+        app_time += cycle_ns;
+
+        // 1. 接收并处理双域 PDO
+        ecrt_master_receive(master_);
+        ecrt_domain_process(domain_out_);
+        ecrt_domain_process(domain_in_);
+
+        // 2. 写安全 PDO 值 —— 控制字=0（不使能）、操作模式=CSP、目标=空闲位置
+        for (size_t i = 0; i < motor_count_; ++i) {
+            const auto& offsets = pdo_offsets_[i];
+            if (isGateway(motor_configs_[i])) {
+                continue;  // 网关跳过（无关节 PDO）
+            }
+            EC_WRITE_U16(domain_out_pd_ + offsets.control_word, 0);
+            if (offsets.operation_mode != 0) {
+                EC_WRITE_S8(domain_out_pd_ + offsets.operation_mode, 8);  // CSP
+            }
+            int32_t idle_pos = idle_input_positions_[i];
+            if (offsets.target_position != 0) {
+                EC_WRITE_S32(domain_out_pd_ + offsets.target_position, idle_pos);
+            }
+            if (offsets.target_velocity != 0) {
+                EC_WRITE_S32(domain_out_pd_ + offsets.target_velocity, 0);
+            }
+            if (offsets.target_torque != 0) {
+                EC_WRITE_S16(domain_out_pd_ + offsets.target_torque, 0);
+            }
+        }
+
+        // 3. DC BurstBulk 同步（12 帧/周期，对齐 EC-Master DCM）
+        ecrt_master_application_time(master_, app_time);
+        constexpr int kSyncBurstCount = 12;
+        for (int b = 0; b < kSyncBurstCount; ++b) {
+            ecrt_master_sync_reference_clock(master_);
+            ecrt_master_sync_slave_clocks(master_);
+        }
+
+        // 4. 排队并发送
+        ecrt_domain_queue(domain_out_);
+        ecrt_domain_queue(domain_in_);
+        ecrt_master_send(master_);
+
+        if (n % 100 == 0 || n == settle_cycles - 1) {
+            ec_master_state_t ms;
+            ecrt_master_state(master_, &ms);
+            std::cout << "  bootstrap " << n << "/" << settle_cycles
+                      << " slaves_responding=" << ms.slaves_responding
+                      << " AL=0x" << std::hex << static_cast<int>(ms.al_states)
+                      << std::dec << " link=" << (ms.link_up ? "up" : "DOWN")
+                      << std::endl;
+        }
+
+        timespec ts{0, static_cast<long>(cycle_ns)};
+        nanosleep(&ts, nullptr);
+    }
+
+    bool dc_locked = false;
+    {
+        ec_master_state_t ms;
+        ecrt_master_state(master_, &ms);
+        dc_locked = (ms.slaves_responding > 0 &&
+                     (ms.al_states & EC_AL_STATE_SAFEOP));
+        std::cout << "[IgH] DC+PDO bootstrap done: slaves=" << ms.slaves_responding
+                  << " AL=0x" << std::hex << static_cast<int>(ms.al_states)
+                  << std::dec << " dc_locked=" << (dc_locked ? "yes" : "no")
+                  << std::endl;
+    }
+
+    return dc_locked;
 }
 
 
@@ -542,12 +631,15 @@ bool EtherCATServo::verifyPdoEvidence(size_t motor_id) const
     const bool joint =
         motor_configs_[motor_id].pdo_layout == PdoLayout::JOINT_MODULE ||
         motor_configs_[motor_id].pdo_layout == PdoLayout::UNKNOWN ||
-        isJointModuleMotor(motor_configs_[motor_id]);
+        isJointModuleMotor(motor_configs_[motor_id]) ||
+        isCoolDriveJmdtMotor(motor_configs_[motor_id]);
 
     auto log_field = [&](const char* name, unsigned int offset) {
+        const bool present = (offset != kPdoOffsetUnset);
         std::cout << "[IgH] PDO_EVIDENCE axis=" << motor_id
                   << " field=" << name
-                  << " present=" << (offset != 0U ? 1 : 0) << std::endl;
+                  << " present=" << (present ? 1 : 0)
+                  << " offset=" << (present ? offset : 0U) << std::endl;
     };
 
     log_field("0x6040_control_word", off.control_word);
@@ -555,12 +647,13 @@ bool EtherCATServo::verifyPdoEvidence(size_t motor_id) const
     log_field("0x6064_actual_position", off.actual_position);
     log_field("0x607A_target_position", off.target_position);
 
-    if (off.status_word == 0U) {
+    if (off.status_word == kPdoOffsetUnset) {
         std::cerr << "[IgH] PDO_EVIDENCE axis=" << motor_id
                   << " result=fail missing 0x6041 status_word" << std::endl;
         return false;
     }
-    if (joint && (off.actual_position == 0U || off.target_position == 0U)) {
+    if (joint && (off.actual_position == kPdoOffsetUnset ||
+                  off.target_position == kPdoOffsetUnset)) {
         std::cerr << "[IgH] PDO_EVIDENCE axis=" << motor_id
                   << " result=fail missing 0x6064/0x607A for joint module"
                   << std::endl;
@@ -1307,7 +1400,7 @@ bool EtherCATServo::registerPDOEntries()
             // CAN/CANFD发送：注册ID、长度和数据字段
             // CAN TX ID (UINT32) - 0x2000:01
             int ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i],
-                    0x2000, 0x01, domain_, nullptr);
+                    0x2000, 0x01, domain_out_, nullptr);
             if (ret < 0) {
                 std::cerr << "❌ Failed to register CAN TX ID (0x2000:01) for gateway " << i << std::endl;
                 return false;
@@ -1318,7 +1411,7 @@ bool EtherCATServo::registerPDOEntries()
             
             // CAN TX length (UINT8) - 0x2000:02
             ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i],
-                    0x2000, 0x02, domain_, nullptr);
+                    0x2000, 0x02, domain_out_, nullptr);
             if (ret < 0) {
                 std::cerr << "❌ Failed to register CAN TX length (0x2000:02) for gateway " << i << std::endl;
                 return false;
@@ -1329,7 +1422,7 @@ bool EtherCATServo::registerPDOEntries()
             
             // CAN TX data (UINT8) - 0x2000:03（第一个数据字节，用于64字节数据）
             ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i],
-                    0x2000, 0x03, domain_, nullptr);
+                    0x2000, 0x03, domain_out_, nullptr);
             if (ret < 0) {
                 std::cerr << "❌ Failed to register CAN TX data (0x2000:03) for gateway " << i << std::endl;
                 return false;
@@ -1341,7 +1434,7 @@ bool EtherCATServo::registerPDOEntries()
             // 注册其余CAN TX数据字节 (0x2000:04 到 0x2000:41，共64字节)
             for (uint8_t subindex = 0x04; subindex <= 0x41; subindex++) {
                 ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i],
-                        0x2000, subindex, domain_, nullptr);
+                        0x2000, subindex, domain_out_, nullptr);
                 if (ret < 0) {
                     std::cerr << "❌ Failed to register CAN TX data byte (0x2000:" 
                               << std::hex << (int)subindex << std::dec << ") for gateway " << i << std::endl;
@@ -1353,7 +1446,7 @@ bool EtherCATServo::registerPDOEntries()
             // RS485_1接收：注册长度和数据字段
             // RS485_1 RX length (UINT8) - 0x2002:01
             ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i],
-                    0x2002, 0x01, domain_, nullptr);
+                    0x2002, 0x01, domain_out_, nullptr);
             if (ret < 0) {
                 std::cerr << "❌ Failed to register 485_1RX length (0x2002:01) for gateway " << i << std::endl;
                 return false;
@@ -1363,7 +1456,7 @@ bool EtherCATServo::registerPDOEntries()
             
             // RS485_1 RX data (UINT8) - 0x2002:02（第一个数据字节）
             ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i],
-                    0x2002, 0x02, domain_, nullptr);
+                    0x2002, 0x02, domain_out_, nullptr);
             if (ret < 0) {
                 std::cerr << "❌ Failed to register 485_1RX data byte (0x2002:02) for gateway " << i << std::endl;
                 return false;
@@ -1374,7 +1467,7 @@ bool EtherCATServo::registerPDOEntries()
             // 注册其余RS485_1 RX数据字节 (0x2002:03 到 0x2002:41，共64字节)
             for (uint8_t subindex = 0x03; subindex <= 0x41; subindex++) {
                 ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i],
-                        0x2002, subindex, domain_, nullptr);
+                        0x2002, subindex, domain_out_, nullptr);
                 if (ret < 0) {
                     std::cerr << "❌ Failed to register 485_1RX data byte (0x2002:" 
                               << std::hex << (int)subindex << std::dec << ") for gateway " << i << std::endl;
@@ -1386,7 +1479,7 @@ bool EtherCATServo::registerPDOEntries()
             // RS485_2接收：注册长度和数据字段
             // RS485_2 RX length (UINT8) - 0x2004:01
             ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i],
-                    0x2004, 0x01, domain_, nullptr);
+                    0x2004, 0x01, domain_out_, nullptr);
             if (ret < 0) {
                 std::cerr << "❌ Failed to register 485_2RX length (0x2004:01) for gateway " << i << std::endl;
                 return false;
@@ -1396,7 +1489,7 @@ bool EtherCATServo::registerPDOEntries()
             
             // RS485_2 RX data (UINT8) - 0x2004:02（第一个数据字节）
             ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i],
-                    0x2004, 0x02, domain_, nullptr);
+                    0x2004, 0x02, domain_out_, nullptr);
             if (ret < 0) {
                 std::cerr << "❌ Failed to register 485_2RX data byte (0x2004:02) for gateway " << i << std::endl;
                 return false;
@@ -1407,7 +1500,7 @@ bool EtherCATServo::registerPDOEntries()
             // 注册其余RS485_2 RX数据字节 (0x2004:03 到 0x2004:41，共64字节)
             for (uint8_t subindex = 0x03; subindex <= 0x41; subindex++) {
                 ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i],
-                        0x2004, subindex, domain_, nullptr);
+                        0x2004, subindex, domain_out_, nullptr);
                 if (ret < 0) {
                     std::cerr << "❌ Failed to register 485_2RX data byte (0x2004:" 
                               << std::hex << (int)subindex << std::dec << ") for gateway " << i << std::endl;
@@ -1420,7 +1513,7 @@ bool EtherCATServo::registerPDOEntries()
             // CAN/CANFD接收：注册ID、长度和数据字段
             // CAN RX ID (UINT32) - 0x2001:01
             ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i],
-                    0x2001, 0x01, domain_, nullptr);
+                    0x2001, 0x01, domain_in_, nullptr);
             if (ret < 0) {
                 std::cerr << "❌ Failed to register CAN RX ID (0x2001:01) for gateway " << i << std::endl;
                 return false;
@@ -1431,7 +1524,7 @@ bool EtherCATServo::registerPDOEntries()
             
             // CAN RX length (UINT8) - 0x2001:02
             ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i],
-                    0x2001, 0x02, domain_, nullptr);
+                    0x2001, 0x02, domain_in_, nullptr);
             if (ret < 0) {
                 std::cerr << "❌ Failed to register CAN RX length (0x2001:02) for gateway " << i << std::endl;
                 return false;
@@ -1442,7 +1535,7 @@ bool EtherCATServo::registerPDOEntries()
             
             // CAN RX data (UINT8) - 0x2001:03（第一个数据字节，用于64字节数据）
             ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i],
-                    0x2001, 0x03, domain_, nullptr);
+                    0x2001, 0x03, domain_in_, nullptr);
             if (ret < 0) {
                 std::cerr << "❌ Failed to register CAN RX data (0x2001:03) for gateway " << i << std::endl;
                 return false;
@@ -1454,7 +1547,7 @@ bool EtherCATServo::registerPDOEntries()
             // 注册其余CAN RX数据字节 (0x2001:04 到 0x2001:42，共64字节)
             for (uint8_t subindex = 0x04; subindex <= 0x42; subindex++) {
                 ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i],
-                        0x2001, subindex, domain_, nullptr);
+                        0x2001, subindex, domain_out_, nullptr);
                 if (ret < 0) {
                     std::cerr << "❌ Failed to register CAN RX data byte (0x2001:" 
                               << std::hex << (int)subindex << std::dec << ") for gateway " << i << std::endl;
@@ -1466,7 +1559,7 @@ bool EtherCATServo::registerPDOEntries()
             // RS485_1发送：注册长度和数据字段
             // RS485_1 TX length (UINT8) - 0x2003:01
             ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i],
-                    0x2003, 0x01, domain_, nullptr);
+                    0x2003, 0x01, domain_in_, nullptr);
             if (ret < 0) {
                 std::cerr << "❌ Failed to register 485_1TX length (0x2003:01) for gateway " << i << std::endl;
                 return false;
@@ -1476,7 +1569,7 @@ bool EtherCATServo::registerPDOEntries()
             
             // RS485_1 TX data (UINT8) - 0x2003:02（第一个数据字节）
             ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i],
-                    0x2003, 0x02, domain_, nullptr);
+                    0x2003, 0x02, domain_in_, nullptr);
             if (ret < 0) {
                 std::cerr << "❌ Failed to register 485_1TX data byte (0x2003:02) for gateway " << i << std::endl;
                 return false;
@@ -1487,7 +1580,7 @@ bool EtherCATServo::registerPDOEntries()
             // 注册其余RS485_1 TX数据字节 (0x2003:03 到 0x2003:41，共64字节)
             for (uint8_t subindex = 0x03; subindex <= 0x41; subindex++) {
                 ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i],
-                        0x2003, subindex, domain_, nullptr);
+                        0x2003, subindex, domain_out_, nullptr);
                 if (ret < 0) {
                     std::cerr << "❌ Failed to register 485_1TX data byte (0x2003:" 
                               << std::hex << (int)subindex << std::dec << ") for gateway " << i << std::endl;
@@ -1500,7 +1593,7 @@ bool EtherCATServo::registerPDOEntries()
             // ⚠️ 注意：某些网关硬件可能不支持0x2005字典，需要先检查是否存在
             // RS485_2 TX length (UINT8) - 0x2005:01
             ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i],
-                    0x2005, 0x01, domain_, nullptr);
+                    0x2005, 0x01, domain_in_, nullptr);
             if (ret < 0) {
                 // 0x2005字典不存在，跳过RS485_2 TX的注册
                 std::cout << "  ⚠️  网关不支持0x2005字典（RS485_2 TX），跳过注册" << std::endl;
@@ -1513,7 +1606,7 @@ bool EtherCATServo::registerPDOEntries()
                 
                 // RS485_2 TX data (UINT8) - 0x2005:02（第一个数据字节）
                 ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i],
-                        0x2005, 0x02, domain_, nullptr);
+                        0x2005, 0x02, domain_in_, nullptr);
                 if (ret < 0) {
                     std::cerr << "  ⚠️  警告: 0x2005:02注册失败，但0x2005:01已成功，可能存在部分子索引缺失" << std::endl;
                     offsets.rs485_2_tx_data = 0;
@@ -1527,7 +1620,7 @@ bool EtherCATServo::registerPDOEntries()
                     int fail_count = 0;
                     for (uint8_t subindex = 0x03; subindex <= 0x41; subindex++) {
                         ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i],
-                                0x2005, subindex, domain_, nullptr);
+                                0x2005, subindex, domain_out_, nullptr);
                         if (ret < 0) {
                             fail_count++;
                             if (fail_count <= 3) {  // 只显示前3个失败的信息，避免日志过多
@@ -1561,83 +1654,87 @@ bool EtherCATServo::registerPDOEntries()
             const char* tag = is_sjd17 ? "SJD17" : "Xinqi";
             std::cout << "Registering " << tag << " JOINT_MODULE PDO for motor " << i << "..." << std::endl;
             memset(&offsets, 0, sizeof(PDOOffsets));
+            offsets.control_word = kPdoOffsetUnset;
+            offsets.status_word = kPdoOffsetUnset;
+            offsets.actual_position = kPdoOffsetUnset;
+            offsets.target_position = kPdoOffsetUnset;
             int ret = 0;
 
-            ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i], 0x6040, 0x00, domain_, nullptr);
+            ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i], 0x6040, 0x00, domain_out_, nullptr);
             if (ret < 0) { std::cerr << tag << ": Failed to register 0x6040" << std::endl; return false; }
             offsets.control_word = ret;
             std::cout << "  ✓ control_word (0x6040): offset=" << ret << std::endl;
 
-            ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i], 0x607A, 0x00, domain_, nullptr);
+            ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i], 0x607A, 0x00, domain_out_, nullptr);
             if (ret < 0) { std::cerr << tag << ": Failed to register 0x607A" << std::endl; return false; }
             offsets.target_position = ret;
             std::cout << "  ✓ target_position (0x607A): offset=" << ret << std::endl;
 
-            ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i], 0x60FF, 0x00, domain_, nullptr);
+            ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i], 0x60FF, 0x00, domain_out_, nullptr);
             if (ret < 0) { std::cerr << tag << ": Failed to register 0x60FF" << std::endl; return false; }
             offsets.target_velocity = ret;
             std::cout << "  ✓ target_velocity (0x60FF): offset=" << ret << std::endl;
 
-            ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i], 0x6071, 0x00, domain_, nullptr);
+            ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i], 0x6071, 0x00, domain_out_, nullptr);
             if (ret < 0) { std::cerr << tag << ": Failed to register 0x6071" << std::endl; return false; }
             offsets.target_torque = ret;
             std::cout << "  ✓ target_torque (0x6071): offset=" << ret << std::endl;
 
-            ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i], 0x6060, 0x00, domain_, nullptr);
+            ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i], 0x6060, 0x00, domain_out_, nullptr);
             if (ret < 0) { std::cerr << tag << ": Failed to register 0x6060" << std::endl; return false; }
             offsets.operation_mode = ret;
             std::cout << "  ✓ operation_mode (0x6060): offset=" << ret << std::endl;
 
-            ret = ecrt_slave_config_reg_pdo_entry_pos(slave_configs_[i], 2, 0, 5, domain_, nullptr);
+            ret = ecrt_slave_config_reg_pdo_entry_pos(slave_configs_[i], 2, 0, 5, domain_out_, nullptr);
             if (ret < 0) { std::cerr << tag << ": Failed to register Rx padding (SM2 entry 5)" << std::endl; return false; }
             offsets.padding_rx = ret;
             std::cout << "  ✓ padding_rx (gap): offset=" << ret << std::endl;
 
-            ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i], 0x6041, 0x00, domain_, nullptr);
+            ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i], 0x6041, 0x00, domain_in_, nullptr);
             if (ret < 0) { std::cerr << tag << ": Failed to register 0x6041" << std::endl; return false; }
             offsets.status_word = ret;
             std::cout << "  ✓ status_word (0x6041): offset=" << ret << std::endl;
 
-            ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i], 0x6064, 0x00, domain_, nullptr);
+            ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i], 0x6064, 0x00, domain_in_, nullptr);
             if (ret < 0) { std::cerr << tag << ": Failed to register 0x6064" << std::endl; return false; }
             offsets.actual_position = ret;
             std::cout << "  ✓ actual_position (0x6064): offset=" << ret << std::endl;
 
-            ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i], 0x606C, 0x00, domain_, nullptr);
+            ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i], 0x606C, 0x00, domain_in_, nullptr);
             if (ret < 0) { std::cerr << tag << ": Failed to register 0x606C" << std::endl; return false; }
             offsets.actual_velocity = ret;
             std::cout << "  ✓ actual_velocity (0x606C): offset=" << ret << std::endl;
 
-            ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i], 0x6077, 0x00, domain_, nullptr);
+            ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i], 0x6077, 0x00, domain_in_, nullptr);
             if (ret < 0) { std::cerr << tag << ": Failed to register 0x6077" << std::endl; return false; }
             offsets.actual_torque = ret;
             std::cout << "  ✓ actual_torque (0x6077): offset=" << ret << std::endl;
 
-            ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i], 0x6061, 0x00, domain_, nullptr);
+            ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i], 0x6061, 0x00, domain_in_, nullptr);
             if (ret < 0) { std::cerr << tag << ": Failed to register 0x6061" << std::endl; return false; }
             offsets.operation_mode_display = ret;
             std::cout << "  ✓ operation_mode_display (0x6061): offset=" << ret << std::endl;
 
             if (is_sjd17) {
-                ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i], 0x2020, 0x00, domain_, nullptr);
+                ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i], 0x2020, 0x00, domain_in_, nullptr);
                 if (ret < 0) { std::cerr << tag << ": Failed to register 0x2020" << std::endl; return false; }
                 offsets.sensor_force_2020 = ret;
                 std::cout << "  ✓ sensor_force_2020 (0x2020): offset=" << ret << std::endl;
 
-                ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i], 0x2021, 0x00, domain_, nullptr);
+                ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i], 0x2021, 0x00, domain_in_, nullptr);
                 if (ret < 0) { std::cerr << tag << ": Failed to register 0x2021" << std::endl; return false; }
                 offsets.motor_encoder_2021 = ret;
                 std::cout << "  ✓ motor_encoder_2021 (0x2021): offset=" << ret << std::endl;
 
                 // SJD17 Tx：entry0..7 = 6041/6064/606C/6077/6061/2020/2021/Gap
-                ret = ecrt_slave_config_reg_pdo_entry_pos(slave_configs_[i], 3, 0, 7, domain_, nullptr);
+                ret = ecrt_slave_config_reg_pdo_entry_pos(slave_configs_[i], 3, 0, 7, domain_in_, nullptr);
                 if (ret < 0) { std::cerr << tag << ": Failed to register Tx padding (SM3 entry 7)" << std::endl; return false; }
                 offsets.padding_tx = ret;
                 std::cout << "  ✓ padding_tx (gap): offset=" << ret << std::endl;
             } else {
                 offsets.sensor_force_2020 = 0;
                 offsets.motor_encoder_2021 = 0;
-                ret = ecrt_slave_config_reg_pdo_entry_pos(slave_configs_[i], 3, 0, 5, domain_, nullptr);
+                ret = ecrt_slave_config_reg_pdo_entry_pos(slave_configs_[i], 3, 0, 5, domain_in_, nullptr);
                 if (ret < 0) { std::cerr << tag << ": Failed to register Tx padding (SM3 entry 5)" << std::endl; return false; }
                 offsets.padding_tx = ret;
                 std::cout << "  ✓ padding_tx (gap): offset=" << ret << std::endl;
@@ -1662,59 +1759,63 @@ bool EtherCATServo::registerPDOEntries()
             const char* tag = "JMDT";
             std::cout << "Registering CoolDrive JMDT PDO for motor " << i << "..." << std::endl;
             memset(&offsets, 0, sizeof(PDOOffsets));
+            offsets.control_word = kPdoOffsetUnset;
+            offsets.status_word = kPdoOffsetUnset;
+            offsets.actual_position = kPdoOffsetUnset;
+            offsets.target_position = kPdoOffsetUnset;
             int ret = 0;
 
-            ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i], 0x6040, 0x00, domain_, nullptr);
+            ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i], 0x6040, 0x00, domain_out_, nullptr);
             if (ret < 0) { std::cerr << tag << ": Failed to register 0x6040" << std::endl; return false; }
             offsets.control_word = ret;
 
-            ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i], 0x6060, 0x00, domain_, nullptr);
+            ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i], 0x6060, 0x00, domain_out_, nullptr);
             if (ret < 0) { std::cerr << tag << ": Failed to register 0x6060" << std::endl; return false; }
             offsets.operation_mode = ret;
 
-            // 0x5FFE padding — register by SM position (Rx entry index 2)
-            ret = ecrt_slave_config_reg_pdo_entry_pos(slave_configs_[i], 2, 0, 2, domain_, nullptr);
+            // 0x5FFE padding（与天机 IgH 一致：按 index 注册）
+            ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i], 0x5FFE, 0x00, domain_out_, nullptr);
             if (ret < 0) { std::cerr << tag << ": Failed to register Rx 0x5FFE pad" << std::endl; return false; }
             offsets.padding_rx = ret;
 
-            ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i], 0x607A, 0x00, domain_, nullptr);
+            ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i], 0x607A, 0x00, domain_out_, nullptr);
             if (ret < 0) { std::cerr << tag << ": Failed to register 0x607A" << std::endl; return false; }
             offsets.target_position = ret;
 
-            ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i], 0x60FF, 0x00, domain_, nullptr);
+            ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i], 0x60FF, 0x00, domain_out_, nullptr);
             if (ret < 0) { std::cerr << tag << ": Failed to register 0x60FF" << std::endl; return false; }
             offsets.target_velocity = ret;
 
-            ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i], 0x6071, 0x00, domain_, nullptr);
+            ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i], 0x6071, 0x00, domain_out_, nullptr);
             if (ret < 0) { std::cerr << tag << ": Failed to register 0x6071" << std::endl; return false; }
             offsets.target_torque = ret;
 
-            ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i], 0x6041, 0x00, domain_, nullptr);
+            ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i], 0x6041, 0x00, domain_in_, nullptr);
             if (ret < 0) { std::cerr << tag << ": Failed to register 0x6041" << std::endl; return false; }
             offsets.status_word = ret;
 
-            ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i], 0x6061, 0x00, domain_, nullptr);
+            ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i], 0x6061, 0x00, domain_in_, nullptr);
             if (ret < 0) { std::cerr << tag << ": Failed to register 0x6061" << std::endl; return false; }
             offsets.operation_mode_display = ret;
 
-            ret = ecrt_slave_config_reg_pdo_entry_pos(slave_configs_[i], 3, 0, 2, domain_, nullptr);
+            ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i], 0x5FFE, 0x00, domain_in_, nullptr);
             if (ret < 0) { std::cerr << tag << ": Failed to register Tx 0x5FFE pad" << std::endl; return false; }
             offsets.padding_tx = ret;
 
-            ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i], 0x6064, 0x00, domain_, nullptr);
+            ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i], 0x6064, 0x00, domain_in_, nullptr);
             if (ret < 0) { std::cerr << tag << ": Failed to register 0x6064" << std::endl; return false; }
             offsets.actual_position = ret;
 
-            ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i], 0x606C, 0x00, domain_, nullptr);
+            ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i], 0x606C, 0x00, domain_in_, nullptr);
             if (ret < 0) { std::cerr << tag << ": Failed to register 0x606C" << std::endl; return false; }
             offsets.actual_velocity = ret;
 
-            ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i], 0x6077, 0x00, domain_, nullptr);
+            ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i], 0x6077, 0x00, domain_in_, nullptr);
             if (ret < 0) { std::cerr << tag << ": Failed to register 0x6077" << std::endl; return false; }
             offsets.actual_torque = ret;
 
             // 0x310B 负载端力矩 → 复用 sensor_force_2020 槽位（产品侧同字段读取）
-            ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i], 0x310B, 0x00, domain_, nullptr);
+            ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i], 0x310B, 0x00, domain_in_, nullptr);
             if (ret < 0) { std::cerr << tag << ": Failed to register 0x310B" << std::endl; return false; }
             offsets.sensor_force_2020 = ret;
             offsets.motor_encoder_2021 = 0;
@@ -1744,22 +1845,25 @@ bool EtherCATServo::registerPDOEntries()
 void EtherCATServo::receiveData()
 {
     // 即使未激活也尝试接收（用于激活前的循环），但需要确保master和domain已初始化
-    if (!initialized_ || !master_ || !domain_) return;
+    if (!initialized_ || !master_ || !domain_out_ || !domain_in_) return;
     
     ecrt_master_receive(master_);
-    ecrt_domain_process(domain_);
+    ecrt_domain_process(domain_out_);
+    ecrt_domain_process(domain_in_);
 
     if (activated_ && motor_count_ > 0 && slave_configs_[0] && sync_handler_) {
-        ec_domain_state_t ds;
-        ecrt_domain_state(domain_, &ds);
+        ec_domain_state_t ds_out{};
+        ec_domain_state_t ds_in{};
+        ecrt_domain_state(domain_out_, &ds_out);
+        ecrt_domain_state(domain_in_, &ds_in);
         ec_slave_config_state_t sc;
         ecrt_slave_config_state(slave_configs_[0], &sc);
-        // 仅在 PDO 交换正常且从站 OP 后才尝试读参考时钟（读失败不影响 sync 报文发送）
+        // 从站进入 SAFEOP 后即可读参考时钟、启动 DC PLL（否则 NH17 等电机
+        // 需 PLL 锁定才进 OP，形成 safeop→op 的鸡生蛋蛋生鸡死锁）。
         const bool ref_clock_readable =
-            ds.working_counter > 0 &&
-            ds.wc_state == EC_WC_COMPLETE &&
-            sc.al_state == EC_AL_STATE_OP &&
-            sc.operational;
+            ds_out.working_counter > 0 && ds_in.working_counter > 0 &&
+            ds_out.wc_state == EC_WC_COMPLETE && ds_in.wc_state == EC_WC_COMPLETE &&
+            (sc.al_state & EC_AL_STATE_SAFEOP);
         sync_handler_->setReferenceClockReady(ref_clock_readable);
     }
 
@@ -1769,14 +1873,18 @@ void EtherCATServo::receiveData()
         !IghMasterRuntime::instance().isJobThreadRunning()) {
         static unsigned int wc_diag_count = 0;
         if (wc_diag_count < 100) {
-            ec_domain_state_t ds;
-            ecrt_domain_state(domain_, &ds);
+            ec_domain_state_t ds_out{};
+            ec_domain_state_t ds_in{};
+            ecrt_domain_state(domain_out_, &ds_out);
+            ecrt_domain_state(domain_in_, &ds_in);
             ec_slave_config_state_t sc;
             ecrt_slave_config_state(slave_configs_[0], &sc);
             if (wc_diag_count % 20 == 0) {
                 std::cout << "[Diag] cycle=" << wc_diag_count
-                          << " WC=" << ds.working_counter
-                          << " wc_state=" << static_cast<int>(ds.wc_state)
+                          << " WC_out=" << ds_out.working_counter
+                          << " WC_in=" << ds_in.working_counter
+                          << " wc_out=" << static_cast<int>(ds_out.wc_state)
+                          << " wc_in=" << static_cast<int>(ds_in.wc_state)
                           << " AL=0x" << std::hex << static_cast<int>(sc.al_state)
                           << std::dec << " online=" << sc.online
                           << " operational=" << sc.operational;
@@ -1797,7 +1905,7 @@ void EtherCATServo::receiveData()
     static const bool DEBUG_CSV_LOGGING = false;
     static const bool DEBUG_CONSOLE_OUTPUT = false;  // 控制台输出
     
-    if (DEBUG_CSV_LOGGING && activated_ && domain_pd_) {
+    if (DEBUG_CSV_LOGGING && activated_ && domain_out_ && domain_in_pd_) {
         static auto last_log_time = std::chrono::steady_clock::now();
         static FILE* csv_file = nullptr;
         static bool csv_opened = false;
@@ -1863,14 +1971,14 @@ void EtherCATServo::receiveData()
                 const auto& offsets = pdo_offsets_[i];
                 
                 // 读取实际位置
-                int32_t actual_pos = EC_READ_S32(domain_pd_ + offsets.actual_position);
+                int32_t actual_pos = EC_READ_S32(domain_in_pd_ + offsets.actual_position);
                 
                 // 读取速度和力矩
-                int32_t actual_vel = EC_READ_S32(domain_pd_ + offsets.actual_velocity);
-                int16_t actual_torque = EC_READ_S16(domain_pd_ + offsets.actual_torque);
+                int32_t actual_vel = EC_READ_S32(domain_in_pd_ + offsets.actual_velocity);
+                int16_t actual_torque = EC_READ_S16(domain_in_pd_ + offsets.actual_torque);
                 
                 // 读取状态字
-                uint16_t status_word = EC_READ_U16(domain_pd_ + offsets.status_word);
+                uint16_t status_word = EC_READ_U16(domain_in_pd_ + offsets.status_word);
                 
                 // 获取目标位置和静止输入位置（使用原子读取）
                 int32_t target_pos = target_positions_[i].load(std::memory_order_acquire);
@@ -1928,7 +2036,7 @@ void EtherCATServo::receiveData()
     
     // ========== 每周期更新PDO数据缓存 ==========
     // 每周期更新，供ROS发布器使用（seqlock 发布一致性快照）
-    if (activated_ && domain_pd_) {
+    if (activated_ && domain_out_ && domain_in_pd_) {
         SeqLockWriter guard(pdo_cache_seq_);
         // 更新所有从站的PDO数据缓存（包括网关）
         for (size_t i = 0; i < motor_count_; ++i) {
@@ -1946,32 +2054,32 @@ void EtherCATServo::receiveData()
                 
                 // CAN/CANFD接收：读取ID、长度和数据字段并保存到内存
                 if (offsets.can_rx_id != 0) {
-                    gw_data.can_rx_id = EC_READ_U32(domain_pd_ + offsets.can_rx_id);
+                    gw_data.can_rx_id = EC_READ_U32(domain_in_pd_ + offsets.can_rx_id);
                 }
                 if (offsets.can_rx_length != 0) {
-                    gw_data.can_rx_length = EC_READ_U8(domain_pd_ + offsets.can_rx_length);
+                    gw_data.can_rx_length = EC_READ_U8(domain_in_pd_ + offsets.can_rx_length);
                 }
                 if (offsets.can_rx_data != 0) {
                     // 读取CAN RX数据（64字节）并保存到内存
-                    memcpy(gw_data.can_rx_data, domain_pd_ + offsets.can_rx_data, 64);
+                    memcpy(gw_data.can_rx_data, domain_in_pd_ + offsets.can_rx_data, 64);
                 }
                 
                 // RS485_1发送：读取长度和数据字段并保存到内存
                 if (offsets.rs485_1_tx_length != 0) {
-                    gw_data.rs485_1_tx_length = EC_READ_U8(domain_pd_ + offsets.rs485_1_tx_length);
+                    gw_data.rs485_1_tx_length = EC_READ_U8(domain_in_pd_ + offsets.rs485_1_tx_length);
                 }
                 if (offsets.rs485_1_tx_data != 0) {
                     // 读取RS485_1 TX数据（64字节）并保存到内存
-                    memcpy(gw_data.rs485_1_tx_data, domain_pd_ + offsets.rs485_1_tx_data, 64);
+                    memcpy(gw_data.rs485_1_tx_data, domain_in_pd_ + offsets.rs485_1_tx_data, 64);
                 }
                 
                 // RS485_2发送：读取长度和数据字段并保存到内存
                 if (offsets.rs485_2_tx_length != 0) {
-                    gw_data.rs485_2_tx_length = EC_READ_U8(domain_pd_ + offsets.rs485_2_tx_length);
+                    gw_data.rs485_2_tx_length = EC_READ_U8(domain_in_pd_ + offsets.rs485_2_tx_length);
                 }
                 if (offsets.rs485_2_tx_data != 0) {
                     // 读取RS485_2 TX数据（64字节）并保存到内存
-                    memcpy(gw_data.rs485_2_tx_data, domain_pd_ + offsets.rs485_2_tx_data, 64);
+                    memcpy(gw_data.rs485_2_tx_data, domain_in_pd_ + offsets.rs485_2_tx_data, 64);
                 }
                 
                 // ⭐ 网关不需要缓存电机相关的数据，跳过
@@ -1980,18 +2088,18 @@ void EtherCATServo::receiveData()
             
             // 电机处理：读取并缓存所有PDO数据
             // 注意：这里只是内存拷贝，速度很快
-            last_status_words_[i] = EC_READ_U16(domain_pd_ + offsets.status_word);
-            last_operation_mode_displays_[i] = EC_READ_S8(domain_pd_ + offsets.operation_mode_display);
-            last_actual_positions_[i] = EC_READ_S32(domain_pd_ + offsets.actual_position);
-            last_actual_velocities_[i] = EC_READ_S32(domain_pd_ + offsets.actual_velocity);
-            last_actual_torques_[i] = EC_READ_S16(domain_pd_ + offsets.actual_torque);
+            last_status_words_[i] = EC_READ_U16(domain_in_pd_ + offsets.status_word);
+            last_operation_mode_displays_[i] = EC_READ_S8(domain_in_pd_ + offsets.operation_mode_display);
+            last_actual_positions_[i] = EC_READ_S32(domain_in_pd_ + offsets.actual_position);
+            last_actual_velocities_[i] = EC_READ_S32(domain_in_pd_ + offsets.actual_velocity);
+            last_actual_torques_[i] = EC_READ_S16(domain_in_pd_ + offsets.actual_torque);
             if (offsets.sensor_force_2020 != 0) {
-                last_sensor_force_2020_[i] = EC_READ_S32(domain_pd_ + offsets.sensor_force_2020);
+                last_sensor_force_2020_[i] = EC_READ_S32(domain_in_pd_ + offsets.sensor_force_2020);
             } else {
                 last_sensor_force_2020_[i] = 0;
             }
             if (offsets.motor_encoder_2021 != 0) {
-                last_motor_encoder_2021_[i] = EC_READ_S32(domain_pd_ + offsets.motor_encoder_2021);
+                last_motor_encoder_2021_[i] = EC_READ_S32(domain_in_pd_ + offsets.motor_encoder_2021);
             } else {
                 last_motor_encoder_2021_[i] = 0;
             }
@@ -2017,11 +2125,11 @@ void EtherCATServo::receiveData()
                       << " torque=" << offsets.actual_torque << std::endl;
             
             // 打印原始数据
-            uint16_t status = EC_READ_U16(domain_pd_ + offsets.status_word);
-            int8_t mode = EC_READ_S8(domain_pd_ + offsets.operation_mode_display);
-            int32_t pos = EC_READ_S32(domain_pd_ + offsets.actual_position);
-            int32_t vel = EC_READ_S32(domain_pd_ + offsets.actual_velocity);
-            int16_t torque = EC_READ_S16(domain_pd_ + offsets.actual_torque);
+            uint16_t status = EC_READ_U16(domain_in_pd_ + offsets.status_word);
+            int8_t mode = EC_READ_S8(domain_in_pd_ + offsets.operation_mode_display);
+            int32_t pos = EC_READ_S32(domain_in_pd_ + offsets.actual_position);
+            int32_t vel = EC_READ_S32(domain_in_pd_ + offsets.actual_velocity);
+            int16_t torque = EC_READ_S16(domain_in_pd_ + offsets.actual_torque);
             
             std::cout << "Motor " << i << " 数据: "
                       << "status=0x" << std::hex << status << std::dec
@@ -2038,8 +2146,8 @@ void EtherCATServo::receiveData()
 void EtherCATServo::sendData()
 {
     // 即使未激活也发送数据（保持数据不变），用于激活前的循环
-    // 但需要确保domain_pd_已初始化
-    if (!initialized_ || !domain_pd_) return;
+    // 但需要确保双域过程数据已初始化
+    if (!initialized_ || !domain_out_pd_ || !domain_in_pd_) return;
 
     if (runtime_logger_) {
         runtime_logger_->flushPendingToBuffer();
@@ -2047,11 +2155,16 @@ void EtherCATServo::sendData()
 
     g_send_data_wc = 0;
     g_send_data_wc_state = 0;
-    if (activated_ && domain_) {
-        ec_domain_state_t ds{};
-        ecrt_domain_state(domain_, &ds);
-        g_send_data_wc = ds.working_counter;
-        g_send_data_wc_state = ds.wc_state;
+    if (activated_ && domain_out_ && domain_in_) {
+        ec_domain_state_t ds_out{};
+        ec_domain_state_t ds_in{};
+        ecrt_domain_state(domain_out_, &ds_out);
+        ecrt_domain_state(domain_in_, &ds_in);
+        const bool ok =
+            ds_out.working_counter > 0 && ds_in.working_counter > 0 &&
+            ds_out.wc_state == EC_WC_COMPLETE && ds_in.wc_state == EC_WC_COMPLETE;
+        g_send_data_wc = ok ? ds_out.working_counter : 0;
+        g_send_data_wc_state = ok ? EC_WC_COMPLETE : ds_out.wc_state;
     }
     
     // 处理所有从站（包括网关）
@@ -2068,32 +2181,32 @@ void EtherCATServo::sendData()
             
             // CAN/CANFD发送：写入ID、长度和数据字段为0
             if (offsets.can_tx_id != 0) {
-                EC_WRITE_U32(domain_pd_ + offsets.can_tx_id, 0);  // CAN TX ID = 0
+                EC_WRITE_U32(domain_out_pd_ + offsets.can_tx_id, 0);  // CAN TX ID = 0
             }
             if (offsets.can_tx_length != 0) {
-                EC_WRITE_U8(domain_pd_ + offsets.can_tx_length, 0);  // CAN/CANFD发送长度 = 0
+                EC_WRITE_U8(domain_out_pd_ + offsets.can_tx_length, 0);  // CAN/CANFD发送长度 = 0
             }
             if (offsets.can_tx_data != 0) {
                 // 清零CAN TX数据（64字节）
-                memset(domain_pd_ + offsets.can_tx_data, 0, 64);
+                memset(domain_out_pd_ + offsets.can_tx_data, 0, 64);
             }
             
             // RS485_1接收：写入长度和数据字段为0
             if (offsets.rs485_1_rx_length != 0) {
-                EC_WRITE_U8(domain_pd_ + offsets.rs485_1_rx_length, 0);  // RS485_1接收长度 = 0（主站发送给网关）
+                EC_WRITE_U8(domain_out_pd_ + offsets.rs485_1_rx_length, 0);  // RS485_1接收长度 = 0（主站发送给网关）
             }
             if (offsets.rs485_1_rx_data != 0) {
                 // 清零RS485_1 RX数据（64字节）
-                memset(domain_pd_ + offsets.rs485_1_rx_data, 0, 64);
+                memset(domain_out_pd_ + offsets.rs485_1_rx_data, 0, 64);
             }
             
             // RS485_2接收：写入长度和数据字段为0
             if (offsets.rs485_2_rx_length != 0) {
-                EC_WRITE_U8(domain_pd_ + offsets.rs485_2_rx_length, 0);  // RS485_2接收长度 = 0（主站发送给网关）
+                EC_WRITE_U8(domain_out_pd_ + offsets.rs485_2_rx_length, 0);  // RS485_2接收长度 = 0（主站发送给网关）
             }
             if (offsets.rs485_2_rx_data != 0) {
                 // 清零RS485_2 RX数据（64字节）
-                memset(domain_pd_ + offsets.rs485_2_rx_data, 0, 64);
+                memset(domain_out_pd_ + offsets.rs485_2_rx_data, 0, 64);
             }
             
             // ⭐ 注意：接收长度字段（网关发送给主站）在receiveData()中读取，这里不需要处理
@@ -2126,7 +2239,8 @@ void EtherCATServo::sendData()
         sendDataCST(i, offsets);
     }
     
-    ecrt_domain_queue(domain_);
+    ecrt_domain_queue(domain_out_);
+    ecrt_domain_queue(domain_in_);
     ecrt_master_send(master_);
 }
 
@@ -2202,7 +2316,7 @@ void EtherCATServo::sendDataCommon(size_t i, const PDOOffsets& offsets)
         const bool wc_ok = (g_send_data_wc_state == EC_WC_COMPLETE);
 
         // 读取状态字（故障检测 / 使能监控）
-        uint16_t sw = EC_READ_U16(domain_pd_ + offsets.status_word);
+        uint16_t sw = EC_READ_U16(domain_in_pd_ + offsets.status_word);
         bool has_fault = isCiA402Fault(sw);
         bool is_operation_enabled = isCiA402OperationEnabled(sw);
         const CIA402State cia_state = getState(sw);
@@ -2322,7 +2436,7 @@ void EtherCATServo::sendDataCommon(size_t i, const PDOOffsets& offsets)
                             enable_fsm_wait_[i]--;
                         } else {
                             // Phase 2结束：检查故障是否已清除
-                            uint16_t sw_now = EC_READ_U16(domain_pd_ + offsets.status_word);
+                            uint16_t sw_now = EC_READ_U16(domain_in_pd_ + offsets.status_word);
                             if ((sw_now & 0x08) == 0) {
                                 // ✓ 故障已清除！设置fault_reset_counter_触发自动使能（通过line 1854的机制）
                                 fault_reset_counter_[i] = 1;  // 下一周期减到0，触发使能
@@ -2386,7 +2500,7 @@ void EtherCATServo::sendDataCommon(size_t i, const PDOOffsets& offsets)
         }
         
     // 写入控制字到PDO
-        EC_WRITE_U16(domain_pd_ + offsets.control_word, control_word_to_write);
+        EC_WRITE_U16(domain_out_pd_ + offsets.control_word, control_word_to_write);
         
         // 更新最后写入的控制字
         last_written_control_words_[i] = control_word_to_write;
@@ -2415,10 +2529,10 @@ void EtherCATServo::sendDataCommon(size_t i, const PDOOffsets& offsets)
     // 写入操作模式 (0x6060)
         if (offsets.operation_mode != 0) {
             int8_t mode_value = static_cast<int8_t>(current_modes_[i]);
-            EC_WRITE_S8(domain_pd_ + offsets.operation_mode, mode_value);
+            EC_WRITE_S8(domain_out_pd_ + offsets.operation_mode, mode_value);
         }
         if (offsets.padding_rx != 0) {
-            EC_WRITE_U8(domain_pd_ + offsets.padding_rx, 0);
+            EC_WRITE_U8(domain_out_pd_ + offsets.padding_rx, 0);
         }
 
         maybeLogTargetSetpoint(i, sw, cia_state_value, control_word_to_write);
@@ -2451,7 +2565,7 @@ void EtherCATServo::sendDataCSP(size_t i, const PDOOffsets& offsets)
     
     // 写入目标位置（无论是否激活都要写入）- 使用原子读取
     int32_t target_pos = target_positions_[i].load(std::memory_order_acquire);
-    EC_WRITE_S32(domain_pd_ + offsets.target_position, target_pos);
+    EC_WRITE_S32(domain_out_pd_ + offsets.target_position, target_pos);
 }
 
 // ========== CSV 模式特定处理 ==========
@@ -2470,7 +2584,7 @@ void EtherCATServo::sendDataCSV(size_t i, const PDOOffsets& offsets)
     // 写入目标速度 (0x60FF) - 使用原子读取
     if (offsets.target_velocity != 0) {
         int32_t target_vel = target_velocities_[i].load(std::memory_order_acquire);
-        EC_WRITE_S32(domain_pd_ + offsets.target_velocity, target_vel);
+        EC_WRITE_S32(domain_out_pd_ + offsets.target_velocity, target_vel);
     }
 }
         
@@ -2481,12 +2595,12 @@ void EtherCATServo::sendDataCST(size_t i, const PDOOffsets& offsets)
         // CST模式：写入目标力矩 (0x6071) - 使用原子读取
         if (offsets.target_torque != 0) {
             int16_t target_torque = target_torques_[i].load(std::memory_order_acquire);
-            EC_WRITE_S16(domain_pd_ + offsets.target_torque, target_torque);
+            EC_WRITE_S16(domain_out_pd_ + offsets.target_torque, target_torque);
         }
         
         // 写入力矩偏移 (0x60B2) - 可选，暂时设置为 0
         if (offsets.digital_outputs != 0) {
-            EC_WRITE_S16(domain_pd_ + offsets.digital_outputs, 0);
+            EC_WRITE_S16(domain_out_pd_ + offsets.digital_outputs, 0);
         }
 }
 
@@ -2998,9 +3112,9 @@ std::vector<MotorStateData> EtherCATServo::getMotorStates() const
         state.operation_mode_display = mode_displays[i];
         
         // 读取数字 I/O （这个不常用，可以保留直接读取或者也做缓存）
-        if (domain_pd_ && pdo_offsets_[i].digital_inputs != 0) {
+        if (domain_in_pd_ && pdo_offsets_[i].digital_inputs != 0) {
             const auto& offsets = pdo_offsets_[i];
-            state.digital_inputs = EC_READ_U32(domain_pd_ + offsets.digital_inputs);
+            state.digital_inputs = EC_READ_U32(domain_in_pd_ + offsets.digital_inputs);
         } else {
             state.digital_inputs = 0;
         }
@@ -3240,19 +3354,27 @@ uint64_t EtherCATServo::getReferenceClockTime() const
 
 void EtherCATServo::checkDomainState()
 {
-    if (!activated_) return;
+    if (!activated_ || !domain_out_ || !domain_in_) return;
     
-    ec_domain_state_t ds;
-    ecrt_domain_state(domain_, &ds);
+    ec_domain_state_t ds_out{};
+    ec_domain_state_t ds_in{};
+    ecrt_domain_state(domain_out_, &ds_out);
+    ecrt_domain_state(domain_in_, &ds_in);
 
-    if (ds.working_counter != domain_state_.working_counter) {
-        std::cout << "Domain: WC " << ds.working_counter << std::endl;
+    if (ds_out.working_counter != domain_out_state_.working_counter ||
+        ds_in.working_counter != domain_in_state_.working_counter) {
+        std::cout << "Domain: WC_out " << ds_out.working_counter
+                  << " WC_in " << ds_in.working_counter << std::endl;
     }
-    if (ds.wc_state != domain_state_.wc_state) {
-        std::cout << "Domain: State " << ds.wc_state << std::endl;
+    if (ds_out.wc_state != domain_out_state_.wc_state ||
+        ds_in.wc_state != domain_in_state_.wc_state) {
+        std::cout << "Domain: State_out " << static_cast<int>(ds_out.wc_state)
+                  << " State_in " << static_cast<int>(ds_in.wc_state) << std::endl;
     }
 
-    domain_state_ = ds;
+    domain_out_state_ = ds_out;
+    domain_in_state_ = ds_in;
+    domain_state_ = ds_out;
 }
 
 void EtherCATServo::checkMasterState()
@@ -3328,11 +3450,14 @@ bool EtherCATServo::checkSlaveStates() const
 
 bool EtherCATServo::areAllSlavesInOP() const
 {
-    if (!activated_ || !master_ || !domain_) return false;
+    if (!activated_ || !master_ || !domain_out_ || !domain_in_) return false;
 
-    ec_domain_state_t ds{};
-    ecrt_domain_state(domain_, &ds);
-    if (ds.working_counter == 0 || ds.wc_state != EC_WC_COMPLETE) {
+    ec_domain_state_t ds_out{};
+    ec_domain_state_t ds_in{};
+    ecrt_domain_state(domain_out_, &ds_out);
+    ecrt_domain_state(domain_in_, &ds_in);
+    if (ds_out.working_counter == 0 || ds_in.working_counter == 0 ||
+        ds_out.wc_state != EC_WC_COMPLETE || ds_in.wc_state != EC_WC_COMPLETE) {
         return false;
     }
 
@@ -3376,9 +3501,15 @@ bool EtherCATServo::initializePositionsFromSDO()
         std::cerr << "SDO初始化必须在initialize()之后调用" << std::endl;
         return false;
     }
-    
+    if (activated_) {
+        // After ecrt_master_activate(), mailbox SDO without cyclic Job can block forever.
+        std::cerr << "initializePositionsFromSDO: master already activated; "
+                  << "call before activate() (IgH mailbox SDO)" << std::endl;
+        return false;
+    }
+
     std::cout << "\n========== 通过SDO读取初始位置 ==========" << std::endl;
-    std::cout << "读取当前位置，避免发送0值导致电机移动" << std::endl;
+    std::cout << "读取当前位置，避免发送0值导致电机移动（activate 前 mailbox）" << std::endl;
     
     const int READ_COUNT = 5;  // 每个电机读取5次
     int success_count = 0;
@@ -3636,6 +3767,11 @@ uint16_t EtherCATServo::readErrorCode(uint8_t motor_id) const
 void EtherCATServo::deactivate()
 {
     IghMasterRuntime::instance().stop();
+    if (master_ && activated_) {
+        ecrt_master_deactivate(master_);
+        domain_out_pd_ = nullptr;
+        domain_in_pd_ = nullptr;
+    }
     activated_ = false;
     safe_output_active_ = false;
 }
@@ -3779,29 +3915,34 @@ void EtherCATServo::applyCommandContentionFallback()
     }
 }
 
-bool EtherCATServo::runJobCycle(bool force_safe_output)
+bool EtherCATServo::runJobCycle(bool force_safe_output, uint64_t app_time_ns)
 {
-    // Job RT path only: receive → domain WKC check → DC sync → safe or normal TX.
+    // Job RT path（对齐天机）：setAppTime → RX → DC sync → safe|TX。
     // force_safe_output comes from runtime latch; also re-reads safeOutputRequired().
     // Must not block (no ROS log / mutex / heap) on this path.
-    if (!initialized_ || !master_ || !domain_) {
+    if (!initialized_ || !master_ || !domain_out_ || !domain_in_) {
         return false;
     }
 
     checkExternalCommandFreshness();
 
+    const uint64_t t = (app_time_ns != 0ULL) ? app_time_ns : getMonotonicTimeNs();
+    setApplicationTime(t);
     receiveData();
 
     bool rx_ok = false;
     {
-        ec_domain_state_t ds{};
-        ecrt_domain_state(domain_, &ds);
-        domain_state_ = ds;
-        rx_ok = (ds.working_counter > 0) && (ds.wc_state == EC_WC_COMPLETE);
+        ec_domain_state_t ds_out{};
+        ec_domain_state_t ds_in{};
+        ecrt_domain_state(domain_out_, &ds_out);
+        ecrt_domain_state(domain_in_, &ds_in);
+        domain_out_state_ = ds_out;
+        domain_in_state_ = ds_in;
+        domain_state_ = ds_out;
+        rx_ok = (ds_out.working_counter > 0) && (ds_in.working_counter > 0) &&
+                (ds_out.wc_state == EC_WC_COMPLETE) && (ds_in.wc_state == EC_WC_COMPLETE);
     }
 
-    const uint64_t t = getMonotonicTimeNs();
-    setApplicationTime(t);
     processSync(t);
 
     const bool safe =
@@ -3817,7 +3958,7 @@ bool EtherCATServo::runJobCycle(bool force_safe_output)
 
 void EtherCATServo::applySafeProcessImageOutputs()
 {
-    if (!initialized_ || !domain_pd_ || !domain_ || !master_) {
+    if (!initialized_ || !domain_out_pd_ || !domain_in_pd_ || !domain_out_ || !domain_in_ || !master_) {
         return;
     }
 
@@ -3871,21 +4012,22 @@ void EtherCATServo::applySafeProcessImageOutputs()
             idle_input_positions_[i] = safe.target_position;
         }
 
-        if (offsets.control_word) {
-            EC_WRITE_U16(domain_pd_ + offsets.control_word, safe_control_word);
+        // Offset 0 is valid (first entry in a domain); only skip unset fields.
+        if (offsets.control_word != kPdoOffsetUnset) {
+            EC_WRITE_U16(domain_out_pd_ + offsets.control_word, safe_control_word);
         }
-        if (offsets.target_position) {
-            EC_WRITE_S32(domain_pd_ + offsets.target_position, safe.target_position);
+        if (offsets.target_position != kPdoOffsetUnset) {
+            EC_WRITE_S32(domain_out_pd_ + offsets.target_position, safe.target_position);
         }
-        if (offsets.target_velocity) {
-            EC_WRITE_S32(domain_pd_ + offsets.target_velocity, safe.target_velocity);
+        if (offsets.target_velocity != 0) {
+            EC_WRITE_S32(domain_out_pd_ + offsets.target_velocity, safe.target_velocity);
         }
-        if (offsets.target_torque) {
-            EC_WRITE_S16(domain_pd_ + offsets.target_torque, safe.target_torque);
+        if (offsets.target_torque != 0) {
+            EC_WRITE_S16(domain_out_pd_ + offsets.target_torque, safe.target_torque);
         }
-        if (offsets.operation_mode) {
+        if (offsets.operation_mode != 0) {
             EC_WRITE_S8(
-              domain_pd_ + offsets.operation_mode,
+              domain_out_pd_ + offsets.operation_mode,
               static_cast<int8_t>(current_modes_[i]));
         }
     }
@@ -3900,7 +4042,8 @@ void EtherCATServo::applySafeProcessImageOutputs()
         }
     }
 
-    ecrt_domain_queue(domain_);
+    ecrt_domain_queue(domain_out_);
+    ecrt_domain_queue(domain_in_);
     ecrt_master_send(master_);
 }
 

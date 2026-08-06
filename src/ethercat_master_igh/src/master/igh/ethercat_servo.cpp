@@ -3866,6 +3866,14 @@ struct timespec EtherCATServo::getDcSleepSpec(uint64_t wakeup_time_ns) const
     return ts;
 }
 
+uint64_t EtherCATServo::getDcApplicationTime() const
+{
+    if (sync_handler_) {
+        return sync_handler_->getApplicationTime();
+    }
+    return getMonotonicTimeNs();
+}
+
 void EtherCATServo::checkExternalCommandFreshness()
 {
     if (!initialized_ || external_cmd_watchdog_ns_ == 0U) {

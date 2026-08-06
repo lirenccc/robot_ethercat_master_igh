@@ -305,7 +305,8 @@ void IghMasterRuntime::jobThreadMain(IghMasterRuntime * self)
   }
 
   // Job 侧连续应用时间（对齐参考实现 wakeup_time 每拍 +PERIOD_NS）。
-  uint64_t app_time = monoNowNs();
+  // 必须落在 DC 应用时基（getSleepSpec = app_time + sys_time_base_），勿直接用墙钟。
+  uint64_t app_time = servo->getDcApplicationTime();
 
   while (self->job_running_.load(std::memory_order_acquire)) {
     app_time += cycle_ns;
@@ -314,9 +315,10 @@ void IghMasterRuntime::jobThreadMain(IghMasterRuntime * self)
     timespec wake = servo->getDcSleepSpec(app_time);
     uint64_t scheduled = timespecToNs(wake);
     const uint64_t now0 = monoNowNs();
-    // 若上拍过慢导致逻辑网格落后墙钟超过 1 周期：对齐墙钟，避免忙等死循环。
+    // 若上拍过慢导致逻辑网格落后墙钟超过 1 周期：对齐到当前应用时基，避免忙等死循环。
+    // 禁止 app_time = now0（墙钟）：PLL 累积后会把 SYNC0/参考钟跳变约一个 sys_time_base_。
     if (scheduled + cycle_ns < now0) {
-      app_time = now0;
+      app_time = servo->getDcApplicationTime();
       wake = servo->getDcSleepSpec(app_time);
       scheduled = timespecToNs(wake);
     }

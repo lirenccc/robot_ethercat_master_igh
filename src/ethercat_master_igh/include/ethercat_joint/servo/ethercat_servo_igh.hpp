@@ -157,6 +157,9 @@ public:
     /** 逻辑 wakeup → 含 DC PLL 漂移补偿的绝对睡眠时刻（Job 线程用） */
     struct timespec getDcSleepSpec(uint64_t wakeup_time_ns) const;
 
+    /** 当前单调时钟折算到 DC 应用时基（mono − sys_time_base_；无 PLL 时等于墙钟） */
+    uint64_t getDcApplicationTime() const;
+
     /** Job 线程每拍开头：外部命令新鲜度检查 */
     void checkExternalCommandFreshness();
     

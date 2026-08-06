@@ -642,7 +642,7 @@ private:
     bool initialized_;
     bool activated_;
     bool startup_evidence_passed_{false};
-    uint32_t cached_bus_cycle_us_{1000};
+    uint32_t cached_bus_cycle_us_{2000};
     uint64_t external_cmd_watchdog_ns_{0};
     bool csv_cmd_watchdog_{false};
     std::vector<CommandFreshnessState> torque_cmd_freshness_;

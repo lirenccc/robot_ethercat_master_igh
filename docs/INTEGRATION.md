@@ -74,7 +74,7 @@ Job records lateness / execution / `deadline_met` / `skipped_slots`.
 | `IGH_LOCK_MEMORY` | `1` | `mlockall` at runtime start |
 | `IGH_REQUIRE_REALTIME` | `1` | Fail-closed if mlock / `SCHED_FIFO` / affinity fails |
 | `IGH_CPU_AFFINITY` | `5` | Timing/Job affinity; `-1` to skip |
-| `IGH_BUS_CYCLE_US` | `1000` | Bus cycle µs (align DC SYNC0) |
+| `IGH_BUS_CYCLE_US` | `2000` | Bus cycle µs (align DC SYNC0) |
 | `IGH_DEBUG_LOG` | `0` | JobDiag stderr (~every 250 cycles) |
 
 Production systemd: `LimitMEMLOCK=infinity`, `LimitRTPRIO=99`.

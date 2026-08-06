@@ -51,8 +51,8 @@ inline uint32_t envU32AllowZeroOr(const char * name, uint32_t default_value)
 
 struct IghMasterConfig
 {
-  /** 默认 1 ms，与 DC SYNC0 对齐；可用 IGH_BUS_CYCLE_US 覆盖 */
-  uint32_t bus_cycle_us{1000};
+  /** 默认 2 ms，与 DC SYNC0 对齐；可用 IGH_BUS_CYCLE_US 覆盖 */
+  uint32_t bus_cycle_us{2000};
   int cpu_affinity{5};
   bool debug_log{false};
   /** IGH_LOCK_MEMORY：启动尽早 mlockall；默认 true */

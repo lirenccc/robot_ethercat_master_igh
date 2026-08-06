@@ -266,15 +266,6 @@ void IghMasterRuntime::timingThreadMain(IghMasterRuntime * self)
     clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &wake, nullptr);
 
     const uint64_t now_ns = monoNowNs();
-    // 临时诊断：timing 线程自身唤醒延迟（区分 Job late 的来源）
-    {
-      static uint64_t wake_diag = 0U;
-      if ((++wake_diag % 250U) == 0U) {
-        const uint64_t late_ns = now_ns > scheduled_wakeup_ns
-          ? now_ns - scheduled_wakeup_ns : 0U;
-        std::cerr << "[IgH] timing-wake late_us=" << (late_ns / 1000U) << std::endl;
-      }
-    }
     self->published_scheduled_wakeup_ns_.store(scheduled_wakeup_ns, std::memory_order_release);
     self->timing_tick_.fetch_add(1, std::memory_order_release);
 

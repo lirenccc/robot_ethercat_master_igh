@@ -61,6 +61,7 @@ struct MotorStateData {
     int16_t actual_torque;
     int32_t sensor_force_2020;  // SJD17 减速器输出端力矩传感器 (TxPDO 0x2020)；未映射时为 0
     int32_t motor_encoder_2021;  // SJD17 电机端（减速器输入端）编码器 (TxPDO 0x2021)；未映射时为 0
+    uint16_t error_code;  // 驱动错误码 (0x603F)；未映射/无故障时为 0
     int16_t target_torque;
     
     int8_t operation_mode_display;  // 0x6061: 操作模式显示寄存器
@@ -111,14 +112,25 @@ public:
     bool activate();
     
     /**
+     * @brief DC 同步预热（activate 后、Job 前）：密集发送 DC 校准帧让从站 PLL 锁定。
+     * @param duration_ms 预热持续时间（毫秒），默认 3000ms。
+     * @return 从站 DC 是否锁定（至少一个从站进入 SAFEOP/OP）。
+     * @details 对应 EC-Master DCM BurstBulk + SettleTime 阶段。JMDT 电机 PLL
+     *          需连续多周期参考时钟帧才能锁定；不预热则 SAFEOP 立即报 PLL error。
+     */
+    bool dcSyncWarmup(uint32_t duration_ms = 3000);
+    
+    /**
      * @brief 停用主站（停止实时通信 / Job）
      */
     void deactivate();
 
     /**
-     * @brief Job 线程一拍：RX → DC sync → (safe|TX)。返回本拍 domain WC 是否完整。
+     * @brief Job 线程一拍（对齐天机）：setAppTime → RX → DC sync → (safe|TX)。
+     * @param app_time_ns Timing 发布的逻辑唤醒时刻（ns）；0 则回退到单调时钟。
+     * @return 本拍 domain WC 是否完整
      */
-    bool runJobCycle(bool force_safe_output);
+    bool runJobCycle(bool force_safe_output, uint64_t app_time_ns = 0);
 
     bool isJobThreadRunning() const;
     uint32_t busCycleUs() const;
@@ -141,6 +153,12 @@ public:
 
     int32_t lastDcDiffNs() const;
     bool isDcStatusValid() const;
+
+    /** 逻辑 wakeup → 含 DC PLL 漂移补偿的绝对睡眠时刻（Job 线程用） */
+    struct timespec getDcSleepSpec(uint64_t wakeup_time_ns) const;
+
+    /** 当前单调时钟折算到 DC 应用时基（mono − sys_time_base_；无 PLL 时等于墙钟） */
+    uint64_t getDcApplicationTime() const;
 
     /** Job 线程每拍开头：外部命令新鲜度检查 */
     void checkExternalCommandFreshness();
@@ -212,6 +230,12 @@ public:
      */
     bool setEnable(uint8_t motor_id, bool enable);
     
+    /**
+     * @brief 显式 CiA402 Fault Reset（须已在 safe-output 且轴失能）
+     * @param motor_id 轴索引，0xFF=全体故障轴
+     */
+    bool requestFaultReset(uint8_t motor_id, bool allow_without_fault = false) noexcept;
+
     /**
      * @brief 设置操作模式
      * @param motor_id 电机 ID (0xFF = 所有电机)
@@ -381,6 +405,9 @@ public:
      * @return 如果所有从站都在OP状态则返回true
      */
     bool areAllSlavesInOP() const;
+
+    /** 诊断：打印每个从站 AL 状态与错误码（0x0134），用于定位进 OP 失败原因 */
+    void diagnoseSlaveAlStates() const;
     
     /**
      * @brief CIA402 状态机控制
@@ -423,15 +450,19 @@ private:
     std::string operationModeToString(OperationMode mode) const;
     OperationMode stringToOperationMode(const std::string& mode_str) const;
 
-    // EtherCAT 对象
+    // EtherCAT 对象（双域：out=LWR / in=LRD，CoolDrive notLRW 不能用单域 LRW）
     unsigned int master_index_;
     ec_master_t* master_;
-    ec_domain_t* domain_;
-    uint8_t* domain_pd_;
+    ec_domain_t* domain_out_;
+    ec_domain_t* domain_in_;
+    uint8_t* domain_out_pd_;
+    uint8_t* domain_in_pd_;
     
     // 状态变量
     ec_master_state_t master_state_;
     ec_domain_state_t domain_state_;
+    ec_domain_state_t domain_out_state_;
+    ec_domain_state_t domain_in_state_;
     
     // 从站配置
     size_t motor_count_;
@@ -458,6 +489,7 @@ private:
         unsigned int actual_torque;
         unsigned int sensor_force_2020;  // 0x2020；未映射时为 0
         unsigned int motor_encoder_2021;  // 0x2021；未映射时为 0
+        unsigned int error_code;          // 0x603F；未映射时为 kPdoOffsetUnset
         unsigned int digital_inputs;
         
         // ⭐ 网关相关 PDO 偏移量（CAN/CANFD/RS485）
@@ -575,6 +607,8 @@ private:
     // ========== PDO 缓存（RT 写 / ROS 读，经 seqlock 发布一致性快照） ==========
     std::vector<uint16_t> last_status_words_;         // 状态字 (0x6041)
     std::vector<int8_t> last_operation_mode_displays_; // 操作模式显示 (0x6061)
+    std::vector<uint16_t> last_error_codes_;          // 驱动错误码 (0x603F)
+    std::vector<uint16_t> fault_reset_cw_;            // 每轴 Fault Reset 控制字（profile 化；默认 0x86）
     std::vector<int32_t> last_actual_positions_;      // 实际位置 (0x6064)
     std::vector<int32_t> last_actual_velocities_;     // 实际速度 (0x606C)
     std::vector<int16_t> last_actual_torques_;        // 实际力矩 (0x6077)
@@ -611,7 +645,7 @@ private:
     bool initialized_;
     bool activated_;
     bool startup_evidence_passed_{false};
-    uint32_t cached_bus_cycle_us_{1000};
+    uint32_t cached_bus_cycle_us_{2000};
     uint64_t external_cmd_watchdog_ns_{0};
     bool csv_cmd_watchdog_{false};
     std::vector<CommandFreshnessState> torque_cmd_freshness_;
@@ -619,6 +653,9 @@ private:
 
     bool safe_output_active_{false};
     std::vector<int32_t> safe_latched_positions_;
+    /** 显式 Fault Reset：0xFFFF=无请求；0x00FF=全体；否则为轴索引。 */
+    std::atomic<uint16_t> explicit_fault_reset_axis_{0xFFFFU};
+    std::atomic<uint16_t> explicit_fault_reset_cycles_{0U};
     
     // PDO 快照用 seqlock；使能命令用 AtomicBool/U8/U16（勿在 RT 路径加阻塞 mutex）
 };
@@ -626,4 +663,3 @@ private:
 } // namespace ethercat_joint
 
 #endif // ETHERCAT_SERVO_IGH_HPP
-

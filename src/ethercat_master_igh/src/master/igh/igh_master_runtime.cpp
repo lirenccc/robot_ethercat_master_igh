@@ -30,6 +30,12 @@ void nsToTimespec(uint64_t ns, timespec & ts)
   ts.tv_nsec = static_cast<long>(ns % 1000000000ull);
 }
 
+uint64_t timespecToNs(const timespec & ts)
+{
+  return static_cast<uint64_t>(ts.tv_sec) * 1000000000ull +
+         static_cast<uint64_t>(ts.tv_nsec);
+}
+
 void updateAtomicMax(std::atomic<uint64_t> & target, uint64_t value)
 {
   uint64_t current = target.load(std::memory_order_relaxed);
@@ -152,14 +158,20 @@ void IghMasterRuntime::clearCommFault()
   wkc_tracker_.reset();
   deadline_tracker_.reset();
   dc_tracker_.reset();
+  dc_warmup_remaining_ = config_.dc_monitor_warmup_cycles;
   healthy_dwell_.requestReset();
   motion_reenable_allowed_.store(false, std::memory_order_release);
 }
 
 void IghMasterRuntime::requestSafeOutput()
 {
-  safe_output_required_.store(true, std::memory_order_release);
-  motion_reenable_allowed_.store(false, std::memory_order_release);
+  const bool already = safe_output_required_.exchange(true, std::memory_order_acq_rel);
+  if (!already) {
+    // 上升沿：禁止使能直至 /request_safety_reset 重计 healthy dwell
+    motion_reenable_allowed_.store(false, std::memory_order_release);
+    // 已在 safe 时勿再 onFault，否则会打断 clearCommFault 后的 dwell 计数
+    healthy_dwell_.onFault();
+  }
 }
 
 bool IghMasterRuntime::releaseSafeOutput()
@@ -254,6 +266,15 @@ void IghMasterRuntime::timingThreadMain(IghMasterRuntime * self)
     clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &wake, nullptr);
 
     const uint64_t now_ns = monoNowNs();
+    // 临时诊断：timing 线程自身唤醒延迟（区分 Job late 的来源）
+    {
+      static uint64_t wake_diag = 0U;
+      if ((++wake_diag % 250U) == 0U) {
+        const uint64_t late_ns = now_ns > scheduled_wakeup_ns
+          ? now_ns - scheduled_wakeup_ns : 0U;
+        std::cerr << "[IgH] timing-wake late_us=" << (late_ns / 1000U) << std::endl;
+      }
+    }
     self->published_scheduled_wakeup_ns_.store(scheduled_wakeup_ns, std::memory_order_release);
     self->timing_tick_.fetch_add(1, std::memory_order_release);
 
@@ -268,9 +289,8 @@ void IghMasterRuntime::timingThreadMain(IghMasterRuntime * self)
 
 void IghMasterRuntime::jobThreadMain(IghMasterRuntime * self)
 {
-  // Timing 线程递增 timing_tick_ → 本 Job 醒来 → runJobCycle(RX/DC sync/TX) →
-  // WKC/deadline/DC AnomalyTracker（仅 operational_）→ healthy dwell。
-  // Healthy 组成：rx_ok ∧ deadline_met ∧ dc_ok ∧ !comm_fault。
+  // 对齐天机单线程 cyclic：wakeup_time += PERIOD → getSleepSpec 睡 → RX/DC/TX。
+  // getSleepSpec 应用 sys_time_base_（PLL）；若不调用则漂移补偿为死代码 → 天机 0xFF51。
   if (!self->applyThreadRealtime(kJobFifoPriority, &self->job_rt_ok_)) {
     self->job_running_.store(false, std::memory_order_release);
     return;
@@ -284,23 +304,26 @@ void IghMasterRuntime::jobThreadMain(IghMasterRuntime * self)
     return;
   }
 
-  while (self->job_running_.load(std::memory_order_acquire)) {
-    // Wait for Timing tick (bounded spin + short sleep to avoid busy-burn)
-    uint64_t tick = self->timing_tick_.load(std::memory_order_acquire);
-    while (tick == self->job_seen_tick_ &&
-           self->job_running_.load(std::memory_order_acquire))
-    {
-      timespec pause{0, 50000};  // 50 us
-      nanosleep(&pause, nullptr);
-      tick = self->timing_tick_.load(std::memory_order_acquire);
-    }
-    if (!self->job_running_.load(std::memory_order_acquire)) {
-      break;
-    }
-    self->job_seen_tick_ = tick;
+  // Job 侧连续应用时间（对齐参考实现 wakeup_time 每拍 +PERIOD_NS）。
+  // 必须落在 DC 应用时基（getSleepSpec = app_time + sys_time_base_），勿直接用墙钟。
+  uint64_t app_time = servo->getDcApplicationTime();
 
-    const uint64_t scheduled =
-      self->published_scheduled_wakeup_ns_.load(std::memory_order_acquire);
+  while (self->job_running_.load(std::memory_order_acquire)) {
+    app_time += cycle_ns;
+
+    // 含 PLL 漂移补偿的绝对睡眠时刻（天机 getSleepSpec 语义）
+    timespec wake = servo->getDcSleepSpec(app_time);
+    uint64_t scheduled = timespecToNs(wake);
+    const uint64_t now0 = monoNowNs();
+    // 若上拍过慢导致逻辑网格落后墙钟超过 1 周期：对齐到当前应用时基，避免忙等死循环。
+    // 禁止 app_time = now0（墙钟）：PLL 累积后会把 SYNC0/参考钟跳变约一个 sys_time_base_。
+    if (scheduled + cycle_ns < now0) {
+      app_time = servo->getDcApplicationTime();
+      wake = servo->getDcSleepSpec(app_time);
+      scheduled = timespecToNs(wake);
+    }
+    clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &wake, nullptr);
+
     const uint64_t actual_wakeup = monoNowNs();
 
     if (self->pending_dwell_fault_.exchange(false, std::memory_order_acq_rel)) {
@@ -308,7 +331,7 @@ void IghMasterRuntime::jobThreadMain(IghMasterRuntime * self)
     }
 
     const bool armed = self->operational_.load(std::memory_order_acquire);
-    const bool rx_ok = servo->runJobCycle(self->safeOutputRequired());
+    const bool rx_ok = servo->runJobCycle(self->safeOutputRequired(), app_time);
     self->last_rx_ok_.store(rx_ok, std::memory_order_relaxed);
 
     if (armed && !self->commFault()) {
@@ -328,7 +351,7 @@ void IghMasterRuntime::jobThreadMain(IghMasterRuntime * self)
     self->diag_deadline_miss_.store(self->timing_stats_.deadline_miss_count, std::memory_order_relaxed);
     self->diag_deadline_met_.store(self->timing_stats_.deadline_met, std::memory_order_relaxed);
 
-    if (armed && !self->commFault()) {
+    if (armed && !self->commFault() && self->config_.require_realtime) {
       const auto dl = self->deadline_tracker_.observe(!self->timing_stats_.deadline_met);
       if (dl.stop_required) {
         self->latchCommFault();
@@ -337,6 +360,8 @@ void IghMasterRuntime::jobThreadMain(IghMasterRuntime * self)
 
     self->sampleDcMonitor(servo);
 
+    // Healthy 组成对齐 EC-Master：rx_ok ∧ deadline_met ∧ dc_ok ∧ !comm_fault。
+    // dc_ok：PLL 未就绪时不挡 dwell；就绪后要求 in_sync。
     const bool dc_ok =
       !self->dc_status_valid_.load(std::memory_order_relaxed) ||
       self->dc_in_sync_.load(std::memory_order_relaxed);
@@ -378,7 +403,8 @@ bool IghMasterRuntime::start(EtherCATServo * servo)
   }
 
   servo_ = servo;
-  operational_.store(true, std::memory_order_release);
+  // Bring-up：等 OP 完成前不武装 anomaly tracker，避免 WC=0 误闩锁
+  operational_.store(false, std::memory_order_release);
   comm_fault_.store(false, std::memory_order_release);
   healthy_dwell_.reset(config_.healthy_dwell_cycles);
   if (safe_output_required_.load(std::memory_order_acquire)) {
@@ -392,12 +418,12 @@ bool IghMasterRuntime::start(EtherCATServo * servo)
   skipped_slots_.store(0, std::memory_order_relaxed);
   timing_stats_ = {};
 
-  timing_rt_ok_.store(false, std::memory_order_relaxed);
+  // 对齐天机：单 Job 线程自睡（getSleepSpec），不再另起 Timing 抢同一亲和核。
+  timing_rt_ok_.store(true, std::memory_order_relaxed);
   job_rt_ok_.store(false, std::memory_order_relaxed);
-  timing_running_.store(true, std::memory_order_release);
+  timing_running_.store(false, std::memory_order_release);
   job_running_.store(true, std::memory_order_release);
 
-  timing_thread_ = std::make_unique<std::thread>(timingThreadMain, this);
   job_thread_ = std::make_unique<std::thread>(jobThreadMain, this);
 
   // Brief settle so RT setup runs
@@ -405,16 +431,16 @@ bool IghMasterRuntime::start(EtherCATServo * servo)
   nanosleep(&settle, nullptr);
 
   if (config_.require_realtime &&
-      (!timing_rt_ok_.load(std::memory_order_acquire) ||
-       !job_rt_ok_.load(std::memory_order_acquire)))
+      !job_rt_ok_.load(std::memory_order_acquire))
   {
-    std::cerr << "[IgH] Timing/Job RT setup failed (fail-closed)" << std::endl;
+    std::cerr << "[IgH] Job RT setup failed (fail-closed)" << std::endl;
     stop();
     return false;
   }
 
   std::cerr << "[IgH] hard-RT Job started bus_cycle_us=" << config_.bus_cycle_us
-            << " affinity=" << config_.cpu_affinity << std::endl;
+            << " affinity=" << config_.cpu_affinity
+            << " (single-thread cyclic, no timing thread)" << std::endl;
   return true;
 }
 

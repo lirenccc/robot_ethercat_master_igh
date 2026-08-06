@@ -38,6 +38,12 @@ constexpr uint64_t nextCycleDeadline(uint64_t scheduled_wakeup_ns,
         return next;
     }
     const uint64_t skipped = ((now_ns - next) / cycle_period_ns) + 1U;
+    // 落后过多时禁止跳到久远未来（会导致 Job 长时间等不到 tick 而忙等）。
+    // 超过 16 拍直接以当前时刻重新基准，宁可丢周期也不让整条实时链睡死。
+    constexpr uint64_t kMaxCatchUpSlots = 16U;
+    if (skipped > kMaxCatchUpSlots) {
+        return now_ns + cycle_period_ns;
+    }
     if (skipped > (UINT64_MAX - next) / cycle_period_ns) {
         return UINT64_MAX;
     }

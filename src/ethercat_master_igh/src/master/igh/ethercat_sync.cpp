@@ -5,42 +5,21 @@
 
 #include "ethercat_joint/master/igh/ethercat_sync.hpp"
 
-#include <fcntl.h>
-#include <unistd.h>
-
 #define CLOCK_TO_USE CLOCK_MONOTONIC
 #define NSEC_PER_SEC 1000000000ULL
 
 namespace ethercat_joint {
 
 int EtherCATSync::readReferenceClockTimeQuiet(uint32_t* time_low)
- {
-     if (!master_ || !time_low) {
-         return -1;
-     }
-
-     /*
-      * IgH 用户态库在 ecrt_master_reference_clock_time() 失败时会向 stderr
-      * 打印 "Failed to get reference clock time"（已知行为，见 etherlab-users
-      * 邮件列表）。从站 DC 正常时该读回仍可能长期 EIO，需抑制刷屏。
-      */
-     fflush(stderr);
-     const int saved_stderr = dup(STDERR_FILENO);
-     const int devnull = open("/dev/null", O_WRONLY);
-     if (devnull >= 0) {
-         dup2(devnull, STDERR_FILENO);
-         close(devnull);
-     }
-
-     const int ret = ecrt_master_reference_clock_time(master_, time_low);
-
-     fflush(stderr);
-     if (saved_stderr >= 0) {
-         dup2(saved_stderr, STDERR_FILENO);
-         close(saved_stderr);
-     }
-     return ret;
- }
+{
+    if (!master_ || !time_low) {
+        return -1;
+    }
+    // 对齐天机：直接读回。禁止在 RT 热路径 dup2/open/close（实测可把 2ms
+    // 周期拖到 100ms+，WKC 永不完整 → areAllSlavesInOP 假超时）。
+    // libethercat 失败时可能打 stderr；失败退避后尝试间隔拉长，刷屏可控。
+    return ecrt_master_reference_clock_time(master_, time_low);
+}
  
  EtherCATSync::EtherCATSync()
      : master_(nullptr), cycle_time_ns_(0),
@@ -68,10 +47,15 @@ int EtherCATSync::readReferenceClockTimeQuiet(uint32_t* time_low)
      dc_diff_ns_ = 0;
      prev_dc_diff_ns_ = 0;
 
-     warmup_cycles_remaining_ = kRefClockWarmupCycles;
-     consecutive_ref_successes_ = 0;
-     consecutive_ref_failures_ = 0;
-     ref_clock_read_disabled_ = false;
+    warmup_cycles_remaining_ = kRefClockWarmupCycles;
+    consecutive_ref_successes_ = 0;
+    consecutive_ref_failures_ = 0;
+    ref_clock_process_cycle_ = 0;
+    ref_clock_fail_streak_ = 0;
+    ref_clock_backoff_ = false;
+    last_good_dc_diff_ns_ = 0;
+    have_good_dc_diff_ = false;
+    ref_clock_read_disabled_ = false;
      ref_clock_disable_logged_ = false;
      
      // 设置初始的应用时间
@@ -87,16 +71,16 @@ int EtherCATSync::readReferenceClockTimeQuiet(uint32_t* time_low)
      return (uint64_t)ts.tv_sec * NSEC_PER_SEC + ts.tv_nsec;
  }
  
- struct timespec EtherCATSync::getSleepSpec(uint64_t wakeup_time_ns)
- {
-     struct timespec ts;
-     // 关键：将逻辑唤醒时间加上漂移补偿基准，得到实际的系统睡眠时间
-     uint64_t target_system_time = wakeup_time_ns + sys_time_base_;
-     
-     ts.tv_sec = target_system_time / NSEC_PER_SEC;
-     ts.tv_nsec = target_system_time % NSEC_PER_SEC;
-     return ts;
- }
+struct timespec EtherCATSync::getSleepSpec(uint64_t wakeup_time_ns) const
+{
+    struct timespec ts;
+    // 关键：将逻辑唤醒时间加上漂移补偿基准，得到实际的系统睡眠时间
+    uint64_t target_system_time = wakeup_time_ns + sys_time_base_;
+    
+    ts.tv_sec = target_system_time / NSEC_PER_SEC;
+    ts.tv_nsec = target_system_time % NSEC_PER_SEC;
+    return ts;
+}
  
 int32_t EtherCATSync::process(uint64_t app_time_ns)
 {
@@ -119,45 +103,53 @@ int32_t EtherCATSync::process(uint64_t app_time_ns)
      * ecrt_master_reference_clock_time() 读取的是上一周期已经发送、
      * 并在本周期 ecrt_master_receive() 中收到的参考时钟数据报结果。
      *
-     * reference_clock_ready_ 只用于限制“读取结果并启动 PLL”，不能
-     * 用来禁止 DC 同步数据报发送，否则会形成：
-     *   等待 SAFEOP/OP -> 才发送 DC -> 从站等待有效 DC 的循环依赖。
+     * 对齐天机参考实现：无 reference_clock_ready 门控；PREOP 阶段读回可能失败，
+     * 由退避逻辑处理。DC 同步数据报始终排入，避免 SAFEOP/OP ↔ DC 循环依赖。
      */
-    const bool may_read_ref_clock = reference_clock_ready_
-        && !ref_clock_read_disabled_
-        && warmup_cycles_remaining_ == 0;
+    const bool may_read_ref_clock =
+        !ref_clock_read_disabled_ && warmup_cycles_remaining_ == 0;
 
     if (may_read_ref_clock) {
-        if (readReferenceClockTimeQuiet(&reference_time_low) == 0) {
+        // 参考时钟读回失败退避（对齐参考实现）：失败越多尝试间隔越长，
+        // 不永久禁用；成功一次即记录 last_good，失败时保持补偿值避免突变。
+        ++ref_clock_process_cycle_;
+        bool attempt_ref_read = true;
+        if (ref_clock_backoff_) {
+            uint64_t interval = kRefClockBackoffEveryCycles;
+            if (ref_clock_fail_streak_ >= kRefClockFailEnterBackoff * 4) {
+                interval = kRefClockBackoffMaxCycles;
+            } else if (ref_clock_fail_streak_ >= kRefClockFailEnterBackoff * 2) {
+                interval = kRefClockBackoffEveryCycles * 5;
+            }
+            attempt_ref_read = (ref_clock_process_cycle_ % interval == 0);
+        }
+        if (attempt_ref_read &&
+            readReferenceClockTimeQuiet(&reference_time_low) == 0) {
             const uint32_t app_time_low = static_cast<uint32_t>(dc_time_ns_);
             dc_diff_ns_ = static_cast<int32_t>(app_time_low - reference_time_low);
             have_reference_time = true;
             consecutive_ref_failures_ = 0;
+            ref_clock_fail_streak_ = 0;
+            ref_clock_backoff_ = false;
+            last_good_dc_diff_ns_ = dc_diff_ns_;
+            have_good_dc_diff_ = true;
             ++consecutive_ref_successes_;
-        } else {
-            dc_diff_ns_ = 0;
+        } else if (attempt_ref_read) {
+            // 本拍尝试读回但失败：保持上次有效差值，避免 DC 补偿突变
+            dc_diff_ns_ = have_good_dc_diff_ ? last_good_dc_diff_ns_ : 0;
             consecutive_ref_successes_ = 0;
             ++consecutive_ref_failures_;
-            if (consecutive_ref_failures_ == 1 ||
-                consecutive_ref_failures_ == 3 ||
-                consecutive_ref_failures_ == kRefClockMaxFailures) {
+            ++ref_clock_fail_streak_;
+            if (ref_clock_fail_streak_ == kRefClockFailEnterBackoff) {
+                ref_clock_backoff_ = true;
                 std::cerr << "DC reference clock read failed ("
-                          << consecutive_ref_failures_ << "/"
-                          << kRefClockMaxFailures
-                          << "); sync frames continue" << std::endl;
+                          << ref_clock_fail_streak_
+                          << "); backoff engaged, sync frames continue"
+                          << std::endl;
             }
-            if (consecutive_ref_failures_ >= kRefClockMaxFailures) {
-                ref_clock_read_disabled_ = true;
-                dc_started_ = false;
-                if (!ref_clock_disable_logged_) {
-                    ref_clock_disable_logged_ = true;
-                    std::cerr << "DC PLL read disabled after "
-                              << kRefClockMaxFailures
-                              << " failures; using monotonic cycle timer. "
-                              << "Slave DC sync (SYNC0) remains active."
-                              << std::endl;
-                }
-            }
+        } else {
+            // 退避间隔内不读：保持 last_good
+            dc_diff_ns_ = have_good_dc_diff_ ? last_good_dc_diff_ns_ : 0;
         }
     } else if (!ref_clock_read_disabled_) {
         dc_diff_ns_ = 0;

@@ -141,7 +141,10 @@ public:
                 ++consecutive_ok_;
             }
             if (consecutive_ok_ >= required_) {
+                // 驻留完成：保持放行直至下次 onFault；勿因偶发 RX 抖动再次清零
                 allow_enable_ = true;
+                armed_ = false;
+                consecutive_ok_ = 0U;
             }
         } else {
             consecutive_ok_ = 0U;

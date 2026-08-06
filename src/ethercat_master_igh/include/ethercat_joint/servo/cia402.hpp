@@ -45,12 +45,14 @@ enum class CIA402State : uint16_t {
  *   CONTROL_WORD_SWITCH_ON      = Shutdown (0x06)
  *   CONTROL_WORD_ENABLE_VOLTAGE = Switch on (0x07)
  *   CONTROL_WORD_ENABLE_OPERATION / KEEP_OPERATION / FAULT_RESET 名实相符
+ * Fault Reset 用 0x86（Shutdown + bit7），对齐新奇 NH17 文档 06->86->06 序列；
+ * 仅置 bit7 的 0x80 不被部分模组接受。
  */
 constexpr uint16_t CONTROL_WORD_SWITCH_ON = 0x06;
 constexpr uint16_t CONTROL_WORD_ENABLE_VOLTAGE = 0x07;
 constexpr uint16_t CONTROL_WORD_ENABLE_OPERATION = 0x0F;
 constexpr uint16_t CONTROL_WORD_KEEP_OPERATION = 0x1F;
-constexpr uint16_t CONTROL_WORD_FAULT_RESET = 0x80;
+constexpr uint16_t CONTROL_WORD_FAULT_RESET = 0x86;
 
 constexpr uint16_t kCia402EnableSequence[4] = {
     CONTROL_WORD_SWITCH_ON,
@@ -68,6 +70,15 @@ constexpr uint16_t kCia402DisableSequence[4] = {
 inline bool isCiA402OperationEnabled(uint16_t status_word)
 {
     return (status_word & 0x08) == 0 && (status_word & 0x04) != 0;
+}
+
+/**
+ * CiA402 Fault 判定：状态字 bit3。
+ * Fault 与 Fault reaction active 均置该位；勿仅用 decode 结果 == FAULT。
+ */
+inline bool isCiA402Fault(uint16_t status_word) noexcept
+{
+    return (status_word & 0x08U) != 0U;
 }
 
 inline CIA402State decodeCia402State(uint16_t status_word)

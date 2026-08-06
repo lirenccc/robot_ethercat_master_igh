@@ -56,6 +56,23 @@ MotorKinematicsParams makePmslmLinearKinematics()
     return p;
 }
 
+MotorKinematicsParams makeJmdtKinematics()
+{
+    // 默认取 J1/J2（减速比 120、20bit 编码器）；各轴差异由 motors_jmdt*.yaml overlay。
+    MotorKinematicsParams p;
+    p.gear_ratio = 120.0;
+    p.torque_gear_ratio = 120.0;
+    p.encoder_resolution = 1048576.0;
+    p.motor_encoder_resolution = 1048576.0;
+    p.output_side_encoder = false;
+    p.velocity_on_motor_encoder = true;
+    p.rated_torque_motor = 0.75;
+    p.max_current_ma = 0.0;
+    p.torque_constant_kt = 0.0;
+    p.gear_efficiency = 1.0;
+    return p;
+}
+
 const std::vector<MotorProfile> kProfiles = {
     {
         "NH17-100-BT-48E",
@@ -67,7 +84,10 @@ const std::vector<MotorProfile> kProfiles = {
         makeNh17Kinematics(),
         246.0,
         0U,
-        true,
+        2000000U, // dc_sync0_ns: DC 周期 = 2ms（对齐 ENI CycleTime0 / 总线周期）
+        0x0300U,  // dc_assign_activate: 激活 SYNC0（IgH 标准 DC；0x0003 只分配周期不激活 SYNC，
+                  //   NH17 模式显示不跟随导致 od=0、拒绝进入 Operation Enabled）
+        true,     // require_interpolation_period_gate: ENI 经 SDO 下载 0x60C2:1=2、0x60C2:2=-3
     },
     {
         "SJD-17-120-NN-S00",
@@ -79,7 +99,10 @@ const std::vector<MotorProfile> kProfiles = {
         makeSjd17Kinematics(),
         225.0,
         0U,
-        false,
+        2000000U, // dc_sync0_ns: DC 周期 = 2ms（对齐 ENI CycleTime0）
+        0x0300U,  // dc_assign_activate: 激活 SYNC0（对齐 ENI ReferenceClock=1 启用 DC；
+                  //   free-run 下模式显示不跟随导致拒绝使能）
+        false,    // require_interpolation_period_gate: ENI 无 0x60C2 SDO 下载（仅备用 PDO 含 AlignByte）
     },
     {
         "PMSLM-LINEAR",
@@ -89,9 +112,27 @@ const std::vector<MotorProfile> kProfiles = {
         },
         PdoLayout::JOINT_MODULE,
         makePmslmLinearKinematics(),
-        500.0,  // deg/s ≡ mm/s soft limit hint
+        500.0,
         0U,
-        true,
+        0U,
+        0x0000U, // dc_assign_activate: 默认关 DC（free-run）
+        true,    // require_interpolation_period_gate: PMSLM 支持 0x60C2
+    },
+    {
+        "COOLDRIVE-JMDT",
+        "CoolDrive JMDT 关节模组（天机 Marvin）",
+        {
+            {0x00000748, 0x00000019},
+        },
+        PdoLayout::COOLDRIVE_JMDT,
+        makeJmdtKinematics(),
+        180.0,
+        720000U,  // dc_shift_ns: SM2 提前 SYNC0 720µs（天机文档：SM2 须比 DC 同步信号至少提前 125µs，
+                  //   否则报 0xFF51 EtherCAT/DC 同步机制不匹配）
+        2000000U, // dc_sync0_ns: DC SYNC0 周期 = 2ms（参考实现实测驱动天机；4ms 报 0xFF51）
+        0x0300U,  // dc_assign_activate: 激活 SYNC0（参考实现实测值；2ms 周期下无需周期分配位）
+        true,     // require_interpolation_period_gate: 校验/下载 0x60C2 对齐 2ms 总线（尝试解决 0xFF51）
+        0x80,     // fault_reset_control_word: 天机需纯 0x80（0x86 不被接受，0xFF51 Fault 清不掉）
     },
 };
 
@@ -157,6 +198,7 @@ const char* MotorProfileRegistry::pdoLayoutName(PdoLayout layout)
     switch (layout) {
         case PdoLayout::JOINT_MODULE: return "joint_module";
         case PdoLayout::GATEWAY: return "gateway";
+        case PdoLayout::COOLDRIVE_JMDT: return "cooldrive_jmdt";
         default: return "unknown";
     }
 }

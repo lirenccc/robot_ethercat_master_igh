@@ -50,12 +50,12 @@ commands (`SupervisedMotion` + startup evidence passed).
 Only `SupervisedMotion` fails `start()` when startup evidence fails. `ObservationOnly` and
 `Commissioning` remain runnable for observation.
 
-## EC-Master-only APIs (for now)
+## API notes
 
-| API | IgH status |
+| API | Status |
 | --- | --- |
 | `Master::cycle_raw` | not ported |
-| `Master::request_fault_reset` | exposed but returns `false` |
+| `Master::request_fault_reset` | safe-output + disabled gate; Fault = 6041 bit3; 10-cycle `0x0080` window |
 
 Upper layers should use `Master::health()` for supervision; a successful `cycle()` alone does
 not authorize motion.
@@ -74,7 +74,7 @@ Job records lateness / execution / `deadline_met` / `skipped_slots`.
 | `IGH_LOCK_MEMORY` | `1` | `mlockall` at runtime start |
 | `IGH_REQUIRE_REALTIME` | `1` | Fail-closed if mlock / `SCHED_FIFO` / affinity fails |
 | `IGH_CPU_AFFINITY` | `5` | Timing/Job affinity; `-1` to skip |
-| `IGH_BUS_CYCLE_US` | `1000` | Bus cycle µs (align DC SYNC0) |
+| `IGH_BUS_CYCLE_US` | `2000` | Bus cycle µs (align DC SYNC0) |
 | `IGH_DEBUG_LOG` | `0` | JobDiag stderr (~every 250 cycles) |
 
 Production systemd: `LimitMEMLOCK=infinity`, `LimitRTPRIO=99`.

@@ -5,7 +5,12 @@
 #include "ethercat_joint/servo/cia402.hpp"
 #include "ethercat_joint/servo/ethercat_servo.hpp"
 
+#include <chrono>
 #include <cmath>
+#include <cstdlib>
+#include <iostream>
+#include <sstream>
+#include <thread>
 
 namespace ethercat_master_igh
 {
@@ -72,6 +77,9 @@ bool Master::map_joints(const std::vector<AxisConfig> & axes, std::string & erro
       case PdoLayout::Gateway:
         motor.pdo_layout = ethercat_joint::PdoLayout::GATEWAY;
         break;
+      case PdoLayout::CoolDriveJmdt:
+        motor.pdo_layout = ethercat_joint::PdoLayout::COOLDRIVE_JMDT;
+        break;
       case PdoLayout::Unknown:
       default:
         motor.pdo_layout = ethercat_joint::PdoLayout::UNKNOWN;
@@ -97,12 +105,22 @@ bool Master::start(std::string & error)
     error = "start: call map_joints first";
     return false;
   }
-  if (!servo_->activate()) {
-    error = "IgH EtherCATServo::activate failed";
-    return false;
-  }
+  // IgH: blocking mailbox SDO must run before ecrt_master_activate(). After activate,
+  // SDO without a running cyclic Job can hang indefinitely (ecrt_master_sdo_upload).
   (void)servo_->tryLoadKinematicsFromSdo();
   (void)servo_->initializePositionsFromSDO();
+  // 对齐天机：activate 只点着主站 + domain_pd；PREOP→OP 交给 Job 周期。
+  if (!servo_->activate()) {
+    error = "IgH EtherCATServo::activate failed (master/domain)";
+    running_ = false;
+    return false;
+  }
+
+  // DC 同步预热：天机 JMDT 在 Job 前 bootstrap 卡 PREOP（AL=0x2），5s 空转无益；
+  // PREOP→OP 交给 Job 周期（对齐天机 activate 后直接 cyclic）。
+  // NH17 等若需 Job 前 settle，可再按 profile 打开短 warmup。
+  (void)0;
+
   startup_evidence_passed_ = servo_->startupEvidencePassed();
   motion_commands_authorized_ = motionPolicyAuthorizesCommands(
     motion_policy_, startup_evidence_passed_);
@@ -122,6 +140,118 @@ bool Master::start(std::string & error)
     servo_->deactivate();
     return false;
   }
+
+  // Job 已跑：等关节进 OP（WC 完整）。超时再 fail-closed。
+  constexpr auto kOpWait = std::chrono::seconds(60);  // extended for NH17 DC lock
+  const auto op_deadline = std::chrono::steady_clock::now() + kOpWait;
+  auto last_log = std::chrono::steady_clock::now();
+  bool all_op = false;
+  while (std::chrono::steady_clock::now() < op_deadline) {
+    all_op = servo_->areAllSlavesInOP();
+    if (all_op) {
+      break;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last_log >= std::chrono::seconds(5)) {
+      last_log = now;
+      const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now - (op_deadline - kOpWait)).count();
+      const auto diag = ethercat_joint::IghMasterRuntime::instance().jobCycleDiag();
+      std::cout << "[IgH] OP wait @" << elapsed_ms
+                << "ms (rx_ok=" << diag.last_rx_ok
+                << " dc_dev=" << diag.dc_deviation_ns << ")" << std::endl;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+  if (!all_op) {
+    error = "IgH slaves did not reach OP within 60s after Job start (WC/AL stuck)";
+    std::cerr << "[IgH] " << error << std::endl;
+    servo_->diagnoseSlaveAlStates();
+    ethercat_joint::IghMasterRuntime::instance().stop();
+    servo_->deactivate();
+    running_ = false;
+    return false;
+  }
+  std::cout << "[IgH] All slaves in OP" << std::endl;
+
+  // CoolDrive 在首批进 OP、DC 仍偏差数百 µs 时会锁存 0xFF51。先等 PLL 收敛，
+  // 再在 safe-output 下发 CiA402 Fault Reset(0x80)；此时尚不 setOperational，
+  // 避免 settle 窗口内的 dcOutOfSync 误闩锁。
+  {
+    constexpr auto kDcSettleTimeout = std::chrono::seconds(5);
+    constexpr int32_t kSettleAbsNs = 80000;  // 80 µs
+    constexpr int kGoodNeeded = 15;          // ~300 ms @ 20 ms poll
+    const auto deadline = std::chrono::steady_clock::now() + kDcSettleTimeout;
+    int good_streak = 0;
+    while (std::chrono::steady_clock::now() < deadline) {
+      const auto diag = ethercat_joint::IghMasterRuntime::instance().jobCycleDiag();
+      const bool settled = diag.dc_status_valid && diag.last_rx_ok != 0 &&
+        (std::llabs(static_cast<long long>(diag.dc_deviation_ns)) <= kSettleAbsNs);
+      if (settled) {
+        if (++good_streak >= kGoodNeeded) {
+          break;
+        }
+      } else {
+        good_streak = 0;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+  }
+
+  // 清软闩、保持 safe-output（clearCommFault 会重断言 safe_output_required）
+  servo_->requestSafetyReset();
+
+  uint16_t first_fault_ec = 0;
+  std::size_t fault_axes = 0;
+  for (std::size_t i = 0; i < axes_.size(); ++i) {
+    const uint16_t ec = servo_->readErrorCode(static_cast<uint8_t>(i));
+    if (ec != 0U) {
+      ++fault_axes;
+      if (first_fault_ec == 0U) {
+        first_fault_ec = ec;
+      }
+    }
+  }
+
+  if (fault_axes > 0U) {
+    // JMDT TxPDO 无 0x603F；以 SDO 为准强制装载 0x80 窗口。
+    auto fail_startup = [&](const std::string & msg) {
+      error = msg;
+      std::cerr << "[IgH] " << error << std::endl;
+      ethercat_joint::IghMasterRuntime::instance().stop();
+      servo_->deactivate();
+      running_ = false;
+      return false;
+    };
+    if (!servo_->requestFaultReset(0xFFU, /*allow_without_fault=*/true)) {
+      std::ostringstream oss;
+      oss << "IgH startup Fault Reset arm failed "
+          << "(safe-output/OP/disable gate), axes_with_ec=" << fault_axes
+          << " first=0x" << std::hex << first_fault_ec << std::dec;
+      return fail_startup(oss.str());
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(80));  // >20×2ms
+    std::size_t remaining = 0;
+    for (std::size_t i = 0; i < axes_.size(); ++i) {
+      if (servo_->readErrorCode(static_cast<uint8_t>(i)) != 0U) {
+        ++remaining;
+      }
+    }
+    if (remaining != 0U) {
+      std::ostringstream oss;
+      oss << "IgH startup Fault Reset incomplete: " << remaining << "/"
+          << fault_axes << " still non-zero (was 0x" << std::hex << first_fault_ec
+          << std::dec << ")";
+      return fail_startup(oss.str());
+    }
+    std::cout << "[IgH] startup Fault Reset cleared " << fault_axes
+              << " axes (was 0x" << std::hex << first_fault_ec << std::dec
+              << ")" << std::endl;
+  }
+
+  ethercat_joint::IghMasterRuntime::instance().setOperational(true);
+  // 武装 anomaly 后再 reset 一次，让 healthy_dwell 从干净状态计时
+  servo_->requestSafetyReset();
 
   const auto n = axes_.size();
   if (motion_commands_authorized_) {
@@ -172,10 +302,11 @@ bool Master::cycle(
       st.fault = true;
       if (i < motor_states.size()) {
         st.status_word = motor_states[i].status_word;
+        st.error_code = motor_states[i].error_code;
       } else {
         st.status_word = 0;
+        st.error_code = 0;
       }
-      st.error_code = 0;
     }
     error = "IgH communication fault (safe-output active)";
     return false;
@@ -230,12 +361,13 @@ bool Master::cycle(
       st.enabled = motor_states[i].enabled;
       st.fault = motor_states[i].fault;
       st.status_word = motor_states[i].status_word;
+      st.error_code = motor_states[i].error_code;
     } else {
       st.enabled = false;
       st.fault = false;
       st.status_word = 0;
+      st.error_code = 0;
     }
-    st.error_code = 0;
   }
 
   error.clear();
@@ -267,9 +399,9 @@ bool Master::request_safety_reset(std::string & error)
   return true;
 }
 
-bool Master::request_fault_reset(uint8_t /*axis_id*/) noexcept
+bool Master::request_fault_reset(uint8_t axis_id) noexcept
 {
-  return false;
+  return running_ && servo_ && servo_->requestFaultReset(axis_id);
 }
 
 void Master::request_safe_output() noexcept

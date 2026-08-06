@@ -51,8 +51,8 @@ inline uint32_t envU32AllowZeroOr(const char * name, uint32_t default_value)
 
 struct IghMasterConfig
 {
-  /** 默认 1 ms，与 DC SYNC0 对齐；可用 IGH_BUS_CYCLE_US 覆盖 */
-  uint32_t bus_cycle_us{1000};
+  /** 默认 2 ms，与 DC SYNC0 对齐；可用 IGH_BUS_CYCLE_US 覆盖 */
+  uint32_t bus_cycle_us{2000};
   int cpu_affinity{5};
   bool debug_log{false};
   /** IGH_LOCK_MEMORY：启动尽早 mlockall；默认 true */
@@ -74,7 +74,12 @@ struct IghMasterConfig
   AnomalyPolicy wkc_anomaly_policy{5U, 16U, 8U};
   AnomalyPolicy deadline_anomaly_policy{10U, 32U, 16U};
   AnomalyPolicy dc_anomaly_policy{5U, 16U, 8U};
-  uint32_t dc_monitor_warmup_cycles{100U};
+  /**
+   * DC 监控预热周期。IgH 软件 PLL 单拍最多收敛约 1 µs，启动/安全复位后
+   * 初始偏差可达 ms 级（NH17 实测 ~1.4 ms），预热需覆盖收敛期（4 ms 周期
+   * 3000 拍 ≈ 12 s），避免收敛过程中误闩锁打断 healthy dwell。
+   */
+  uint32_t dc_monitor_warmup_cycles{3000U};
   /** DC |deviation| 阈值（ns）；默认 0.5 ms */
   uint32_t dc_sync_threshold_ns{500000U};
   uint32_t healthy_dwell_cycles{50U};

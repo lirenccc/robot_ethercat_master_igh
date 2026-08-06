@@ -360,7 +360,13 @@ void IghMasterRuntime::jobThreadMain(IghMasterRuntime * self)
 
     self->sampleDcMonitor(servo);
 
-    const bool healthy = !self->commFault();
+    // Healthy 组成对齐 EC-Master：rx_ok ∧ deadline_met ∧ dc_ok ∧ !comm_fault。
+    // dc_ok：PLL 未就绪时不挡 dwell；就绪后要求 in_sync。
+    const bool dc_ok =
+      !self->dc_status_valid_.load(std::memory_order_relaxed) ||
+      self->dc_in_sync_.load(std::memory_order_relaxed);
+    const bool healthy =
+      rx_ok && self->timing_stats_.deadline_met && dc_ok && !self->commFault();
     self->healthy_dwell_.observe(healthy);
     self->syncMotionReenableFlag();
 

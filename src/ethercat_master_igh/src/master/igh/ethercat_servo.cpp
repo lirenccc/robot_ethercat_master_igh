@@ -100,7 +100,8 @@ uint16_t resolveDcAssignActivate(const MotorConfig & cfg)
     return 0x0300U;
 }
 
-/** SYNC0 周期（ns）：优先 motor_profile.dc_sync0_ns（JMDT=2ms）；0 → 沿用总线周期。 */
+/** SYNC0 周期（ns）：优先 motor_profile.dc_sync0_ns；0 → 沿用总线周期。
+ *  profile 显式值须与总线周期一致，否则由调用方 fail-closed。 */
 uint32_t resolveDcSync0Ns(const MotorConfig & cfg, uint32_t bus_cycle_ns)
 {
     if (const MotorProfile * profile = resolveMotorProfile(cfg)) {
@@ -109,6 +110,17 @@ uint32_t resolveDcSync0Ns(const MotorConfig & cfg, uint32_t bus_cycle_ns)
         }
     }
     return bus_cycle_ns;
+}
+
+/** profile.dc_sync0_ns 与总线不一致时返回 false（避免 Job 节拍与 SYNC0 脱钩）。 */
+bool dcSync0MatchesBus(const MotorConfig & cfg, uint32_t bus_cycle_ns)
+{
+    if (const MotorProfile * profile = resolveMotorProfile(cfg)) {
+        if (profile->dc_sync0_ns > 0U && profile->dc_sync0_ns != bus_cycle_ns) {
+            return false;
+        }
+    }
+    return true;
 }
 
 inline bool isGateway(const MotorConfig& cfg)
@@ -273,8 +285,18 @@ bool EtherCATServo::initialize(const std::vector<MotorConfig>& motor_configs)
         
         // DC：SYNC0 周期优先 motor_profile.dc_sync0_ns（JMDT 需 2ms），否则沿用总线周期。
         // shift 来自 motor_profile.dc_shift_ns（JMDT=720µs 对齐天机 IgH）。
+        // profile 显式 SYNC0 须等于 IGH_BUS_CYCLE_US，否则 fail-closed。
         const uint32_t bus_cycle_ns =
             (cached_bus_cycle_us_ > 0U ? cached_bus_cycle_us_ : 1000U) * 1000U;
+        if (!dcSync0MatchesBus(cfg, bus_cycle_ns)) {
+            const uint32_t sync0 = resolveDcSync0Ns(cfg, bus_cycle_ns);
+            std::cerr << "[IgH] DC SYNC0 mismatch axis=" << i
+                      << " profile_sync0_us=" << (sync0 / 1000U)
+                      << " bus_cycle_us=" << (bus_cycle_ns / 1000U)
+                      << " (set IGH_BUS_CYCLE_US to match profile, or set profile dc_sync0_ns=0)"
+                      << std::endl;
+            return false;
+        }
         const uint32_t sync0_ns = resolveDcSync0Ns(cfg, bus_cycle_ns);
         const uint32_t dc_shift_ns = resolveDcShiftNs(cfg);
         const uint16_t dc_assign = resolveDcAssignActivate(cfg);

@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
+#include <sstream>
 #include <thread>
 
 namespace ethercat_master_igh
@@ -163,7 +164,7 @@ bool Master::start(std::string & error)
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
   }
   if (!all_op) {
-    error = "IgH slaves did not reach OP within 30s after Job start (WC/AL stuck)";
+    error = "IgH slaves did not reach OP within 60s after Job start (WC/AL stuck)";
     std::cerr << "[IgH] " << error << std::endl;
     servo_->diagnoseSlaveAlStates();
     ethercat_joint::IghMasterRuntime::instance().stop();
@@ -214,28 +215,38 @@ bool Master::start(std::string & error)
 
   if (fault_axes > 0U) {
     // JMDT TxPDO 无 0x603F；以 SDO 为准强制装载 0x80 窗口。
+    auto fail_startup = [&](const std::string & msg) {
+      error = msg;
+      std::cerr << "[IgH] " << error << std::endl;
+      ethercat_joint::IghMasterRuntime::instance().stop();
+      servo_->deactivate();
+      running_ = false;
+      return false;
+    };
     if (!servo_->requestFaultReset(0xFFU, /*allow_without_fault=*/true)) {
-      std::cerr << "[IgH] startup Fault Reset arm failed "
-                << "(safe-output/OP/disable gate), axes_with_ec=" << fault_axes
-                << " first=0x" << std::hex << first_fault_ec << std::dec << std::endl;
-    } else {
-      std::this_thread::sleep_for(std::chrono::milliseconds(80));  // >20×2ms
-      std::size_t remaining = 0;
-      for (std::size_t i = 0; i < axes_.size(); ++i) {
-        if (servo_->readErrorCode(static_cast<uint8_t>(i)) != 0U) {
-          ++remaining;
-        }
-      }
-      if (remaining == 0U) {
-        std::cout << "[IgH] startup Fault Reset cleared " << fault_axes
-                  << " axes (was 0x" << std::hex << first_fault_ec << std::dec
-                  << ")" << std::endl;
-      } else {
-        std::cerr << "[IgH] startup Fault Reset incomplete: " << remaining
-                  << "/" << fault_axes << " still non-zero (was 0x"
-                  << std::hex << first_fault_ec << std::dec << ")" << std::endl;
+      std::ostringstream oss;
+      oss << "IgH startup Fault Reset arm failed "
+          << "(safe-output/OP/disable gate), axes_with_ec=" << fault_axes
+          << " first=0x" << std::hex << first_fault_ec << std::dec;
+      return fail_startup(oss.str());
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(80));  // >20×2ms
+    std::size_t remaining = 0;
+    for (std::size_t i = 0; i < axes_.size(); ++i) {
+      if (servo_->readErrorCode(static_cast<uint8_t>(i)) != 0U) {
+        ++remaining;
       }
     }
+    if (remaining != 0U) {
+      std::ostringstream oss;
+      oss << "IgH startup Fault Reset incomplete: " << remaining << "/"
+          << fault_axes << " still non-zero (was 0x" << std::hex << first_fault_ec
+          << std::dec << ")";
+      return fail_startup(oss.str());
+    }
+    std::cout << "[IgH] startup Fault Reset cleared " << fault_axes
+              << " axes (was 0x" << std::hex << first_fault_ec << std::dec
+              << ")" << std::endl;
   }
 
   ethercat_joint::IghMasterRuntime::instance().setOperational(true);

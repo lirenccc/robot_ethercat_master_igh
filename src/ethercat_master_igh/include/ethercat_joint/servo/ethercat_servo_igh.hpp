@@ -59,7 +59,7 @@ struct MotorStateData {
     int32_t actual_velocity;
     int32_t target_velocity;
     int16_t actual_torque;
-    int32_t sensor_force_2020;  // SJD17 减速器输出端力矩传感器 (TxPDO 0x2020)；未映射时为 0
+    int32_t sensor_force_2020;  // 负载力矩 raw 槽：SJD17=0x2020；JMDT=0x310B；未映射为 0
     int32_t motor_encoder_2021;  // SJD17 电机端（减速器输入端）编码器 (TxPDO 0x2021)；未映射时为 0
     uint16_t error_code;  // 驱动错误码 (0x603F)；未映射/无故障时为 0
     int16_t target_torque;

@@ -2720,12 +2720,16 @@ bool EtherCATServo::setOperationMode(uint8_t motor_id, OperationMode mode)
         }
     };
 
-    // 幂等：已在目标模式则跳过（避免 Master::cycle 每拍 sleep/日志）
+    auto is_gw = [this](size_t i) {
+        const auto & cfg = motor_configs_[i];
+        return cfg.vendor_id == kGatewayVendorId && cfg.product_code == kGatewayProductCode;
+    };
+
+    // 幂等：已在目标模式则跳过（Master::cycle 每拍都会调用）
     if (motor_id == 0xFF) {
         bool all_same = true;
         for (size_t i = 0; i < motor_count_; ++i) {
-            const auto & cfg = motor_configs_[i];
-            if (cfg.vendor_id == kGatewayVendorId && cfg.product_code == kGatewayProductCode) {
+            if (is_gw(i)) {
                 continue;
             }
             if (i >= current_modes_.size() || current_modes_[i] != mode) {
@@ -2740,149 +2744,45 @@ bool EtherCATServo::setOperationMode(uint8_t motor_id, OperationMode mode)
         return true;
     }
 
-    // 模式切换前，先检查并失能所有电机
-    bool was_enabled = false;
-    if (activated_) {
+    // RT 安全：切模式时不关使能、不 sleep。切入 CSP 时对齐 0x607A/idle 到实际位。
+    auto apply_axis = [&](size_t i) {
+        if (is_gw(i) || i >= current_modes_.size()) {
+            return;
+        }
+        const OperationMode previous = current_modes_[i];
+        if (previous == mode) {
+            return;
+        }
+        if (mode == OperationMode::CYCLIC_SYNC_POSITION &&
+            previous != OperationMode::CYCLIC_SYNC_POSITION)
+        {
+            int32_t pos = last_actual_positions_[i];
+            idle_input_positions_[i] = pos;
+            target_positions_[i].store(pos, std::memory_order_release);
+            position_override_active_[i] = true;
+        } else if (mode == OperationMode::CYCLIC_SYNC_VELOCITY &&
+            previous != OperationMode::CYCLIC_SYNC_VELOCITY)
+        {
+            idle_input_velocities_[i] = 0;
+            target_velocities_[i].store(0, std::memory_order_release);
+            velocity_override_active_[i] = false;
+        }
+        disarmLeavingMode(i, previous, mode);
+        current_modes_[i] = mode;
+        if (!enable_requested_[i]) {
+            control_word_states_[i].store(CONTROL_WORD_SWITCH_ON, std::memory_order_release);
+            pending_control_words_[i] = CONTROL_WORD_SWITCH_ON;
+        }
+    };
+
+    if (motor_id == 0xFF) {
         for (size_t i = 0; i < motor_count_; ++i) {
-            if (enable_requested_[i]) {
-                was_enabled = true;
-                break;
-            }
+            apply_axis(i);
         }
-        
-        if (was_enabled) {
-            std::cout << "Disabling all motors before mode change..." << std::endl;
-            setEnable(0xFF, false);
-            // 等待失能 FSM 完成（至少数个 EtherCAT 周期）
-            std::this_thread::sleep_for(std::chrono::milliseconds(300));
-        }
-    }
-    
-    // ⭐⭐⭐ 关键修复：如果切换到CSP模式，先初始化位置参数，再设置模式（避免突变）
-    if (activated_ && mode == OperationMode::CYCLIC_SYNC_POSITION) {
-        std::cout << "\n=== 切换到CSP模式：先初始化位置参数（避免突变） ===" << std::endl;
-        std::cout << "从last_actual_positions缓存读取当前位置并更新所有位置参数" << std::endl;
-        
-        // ⭐ 确定需要初始化的电机范围（在锁外计算，减少锁持有时间）
-        size_t process_count = (motor_id == 0xFF) ? motor_count_ : (motor_id + 1);
-        size_t start_idx = (motor_id == 0xFF) ? 0 : motor_id;
-        
-        // ⭐ 已移除 data_mutex_，直接读取缓存（低频更新，线程安全）
-        std::vector<int32_t> positions;
-        positions.reserve(process_count - start_idx);
-        for (size_t motor_idx = start_idx; motor_idx < process_count; ++motor_idx) {
-            const auto& cfg = motor_configs_[motor_idx];
-            if (cfg.vendor_id == kGatewayVendorId && cfg.product_code == kGatewayProductCode) {
-                continue;
-            }
-            positions.push_back(last_actual_positions_[motor_idx]);
-        }
-        
-        // ⭐ 已移除 data_mutex_，使用原子操作
-        size_t pos_idx = 0;
-        for (size_t motor_idx = start_idx; motor_idx < process_count; ++motor_idx) {
-            // 跳过网关
-            const auto& cfg = motor_configs_[motor_idx];
-            if (cfg.vendor_id == kGatewayVendorId && cfg.product_code == kGatewayProductCode) {
-                continue;
-            }
-            
-            int32_t final_pos = positions[pos_idx++];
-            
-            // ⭐ 更新所有位置相关参数（直接更新，无需buffer）
-            idle_input_positions_[motor_idx] = final_pos;
-            // ⭐ 使用原子操作更新目标位置
-            target_positions_[motor_idx].store(final_pos, std::memory_order_release);
-            
-            // ⭐⭐⭐ 关键：位置参数初始化完成后，再设置模式（避免在初始化前发送错误位置）
-            disarmLeavingMode(motor_idx, current_modes_[motor_idx], mode);
-            current_modes_[motor_idx] = mode;
-            // 模式切换时，重置控制字状态
-            if (!enable_requested_[motor_idx]) {
-                control_word_states_[motor_idx].store(CONTROL_WORD_SWITCH_ON, std::memory_order_release);
-                pending_control_words_[motor_idx] = CONTROL_WORD_SWITCH_ON;
-            }
-        }
-        
-        // ⭐ 打印信息移到锁外（避免阻塞）
-        std::cout << "✓ CSP模式位置参数初始化完成，模式已设置" << std::endl;
-        std::cout << "✓ CSP模式已稳定，现在可以使能电机\n" << std::endl;
-    } else if (activated_ && mode == OperationMode::CYCLIC_SYNC_VELOCITY) {
-        // ⭐⭐⭐ CSV模式：初始化速度为0，再设置模式（避免突变）
-        std::cout << "\n=== 切换到CSV模式：先初始化速度参数（避免突变） ===" << std::endl;
-        std::cout << "设置所有速度为0" << std::endl;
-        
-        // ⭐ 确定需要初始化的电机范围
-        size_t process_count = (motor_id == 0xFF) ? motor_count_ : (motor_id + 1);
-        size_t start_idx = (motor_id == 0xFF) ? 0 : motor_id;
-        
-        // ⭐ 已移除 data_mutex_，使用原子操作初始化速度
-        for (size_t motor_idx = start_idx; motor_idx < process_count; ++motor_idx) {
-            // 跳过网关
-            const auto& cfg = motor_configs_[motor_idx];
-            if (cfg.vendor_id == kGatewayVendorId && cfg.product_code == kGatewayProductCode) {
-                continue;
-            }
-            
-            // ⭐ 初始化所有速度为0
-            idle_input_velocities_[motor_idx] = 0;
-            // ⭐ 使用原子操作更新目标速度
-            target_velocities_[motor_idx].store(0, std::memory_order_release);
-            velocity_override_active_[motor_idx] = false;
-            
-            // ⭐⭐⭐ 关键：速度参数初始化完成后，再设置模式
-            disarmLeavingMode(motor_idx, current_modes_[motor_idx], mode);
-            current_modes_[motor_idx] = mode;
-            // 模式切换时，重置控制字状态
-            if (!enable_requested_[motor_idx]) {
-                control_word_states_[motor_idx].store(CONTROL_WORD_SWITCH_ON, std::memory_order_release);
-                pending_control_words_[motor_idx] = CONTROL_WORD_SWITCH_ON;
-            }
-        }
-        
-        std::cout << "✓ CSV模式速度参数初始化完成（所有速度=0），模式已设置" << std::endl;
+    } else if (motor_id < motor_count_) {
+        apply_axis(motor_id);
     } else {
-        // ⭐ 其他模式：直接设置模式（已移除 data_mutex_）
-        if (motor_id == 0xFF) {
-            for (size_t i = 0; i < motor_count_; ++i) {
-                const auto& cfg = motor_configs_[i];
-                if (cfg.vendor_id == kGatewayVendorId && cfg.product_code == kGatewayProductCode) {
-                    continue;
-                }
-                disarmLeavingMode(i, current_modes_[i], mode);
-                current_modes_[i] = mode;
-                if (!enable_requested_[i]) {
-                    control_word_states_[i] = CONTROL_WORD_SWITCH_ON;
-                    pending_control_words_[i] = CONTROL_WORD_SWITCH_ON;
-                }
-            }
-            std::cout << "Set operation_mode=" << operationModeToString(mode) 
-                      << " for all motors" << std::endl;
-        } else if (motor_id < motor_count_) {
-            disarmLeavingMode(motor_id, current_modes_[motor_id], mode);
-            current_modes_[motor_id] = mode;
-            if (!enable_requested_[motor_id]) {
-                control_word_states_[motor_id] = CONTROL_WORD_SWITCH_ON;
-                pending_control_words_[motor_id] = CONTROL_WORD_SWITCH_ON;
-            }
-            std::cout << "Set operation_mode=" << operationModeToString(mode) 
-                      << " for motor " << (int)motor_id << std::endl;
-        }
-    }
-    
-    // ⭐ 模式切换后，等待模式生效并重新使能
-    if (activated_) {
-        std::cout << "Waiting for mode switch to take effect..." << std::endl;
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
-
-        std::cout << "Enabling all motors after mode change..." << std::endl;
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-
-        try {
-            setEnable(0xFF, true);
-        } catch (const std::exception& e) {
-            std::cerr << "Warning: Exception when enabling motors: " << e.what() << std::endl;
-        }
+        return false;
     }
 
     if (runtime_logger_) {
@@ -2897,7 +2797,7 @@ bool EtherCATServo::setOperationMode(uint8_t motor_id, OperationMode mode)
         fillRuntimeEventTargets(ev, log_motor);
         runtime_logger_->queueCommand(ev);
     }
-    
+
     return true;
 }
 

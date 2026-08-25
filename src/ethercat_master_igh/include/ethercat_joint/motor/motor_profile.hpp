@@ -25,6 +25,8 @@ enum class PdoLayout {
     GATEWAY,
     /** CoolDrive JMDT（天机 Marvin）：Rx 6040/6060/5FFE/607A/60FF/6071；Tx 6041/6061/5FFE/6064/606C/6077/310B */
     COOLDRIVE_JMDT,
+    /** 宇立 SRI M8126 六维力信号处理器：Rx 0x1601/0x7010；Tx f32=0x1A03/0x6030，i32=0x1A02/0x6020 */
+    SRI_M8126,
 };
 
 struct SlaveIdentity {

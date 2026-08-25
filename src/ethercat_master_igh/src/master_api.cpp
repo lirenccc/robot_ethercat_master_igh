@@ -18,7 +18,127 @@ namespace
 {
 constexpr double kRadToDeg = 180.0 / 3.14159265358979323846;
 constexpr double kDegToRad = 3.14159265358979323846 / 180.0;
+
+ethercat_joint::MotorConfig to_motor_config(const AxisConfig & axis)
+{
+  ethercat_joint::MotorConfig motor;
+  motor.alias = axis.alias;
+  motor.position = axis.position;
+  motor.vendor_id = axis.vendor_id;
+  motor.product_code = axis.product_code;
+  motor.name = axis.joint_name;
+  motor.model_id = axis.model_id;
+  switch (axis.pdo_layout) {
+    case PdoLayout::JointModule:
+      motor.pdo_layout = ethercat_joint::PdoLayout::JOINT_MODULE;
+      break;
+    case PdoLayout::Gateway:
+      motor.pdo_layout = ethercat_joint::PdoLayout::GATEWAY;
+      break;
+    case PdoLayout::CoolDriveJmdt:
+      motor.pdo_layout = ethercat_joint::PdoLayout::COOLDRIVE_JMDT;
+      break;
+    case PdoLayout::SriM8126:
+      motor.pdo_layout = ethercat_joint::PdoLayout::SRI_M8126;
+      break;
+    case PdoLayout::Unknown:
+    default:
+      motor.pdo_layout = ethercat_joint::PdoLayout::UNKNOWN;
+      break;
+  }
+  return motor;
+}
+
+bool validate_bus_slaves(const std::vector<AxisConfig> & slaves)
+{
+  for (const auto & slave : slaves) {
+    if (slave.vendor_id == 0U || slave.product_code == 0U) {
+      return false;
+    }
+    if (slave.pdo_layout != PdoLayout::SriM8126) {
+      return false;
+    }
+  }
+  return true;
+}
+
 }  // namespace
+
+bool Master::map_joints(const std::vector<AxisConfig> & axes, std::string & error)
+{
+  return map_joints(axes, {}, error);
+}
+
+bool Master::map_joints(
+  const std::vector<AxisConfig> & axes,
+  const std::vector<AxisConfig> & bus_slaves,
+  std::string & error)
+{
+  if (!servo_) {
+    error = "map_joints: master has been shut down";
+    return false;
+  }
+  const auto validation = validate_axis_configs(axes);
+  if (validation != AxisConfigError::None) {
+    error = "map_joints: invalid axis configuration (" +
+      std::to_string(static_cast<unsigned>(validation)) + ")";
+    return false;
+  }
+  if (!validate_bus_slaves(bus_slaves)) {
+    error = "map_joints: invalid bus slave configuration (expect SRI M8126 VID/PID)";
+    return false;
+  }
+  if (axes.empty() && bus_slaves.empty()) {
+    error = "map_joints: axes and bus_slaves both empty";
+    return false;
+  }
+  std::vector<ethercat_joint::MotorConfig> motors;
+  motors.reserve(axes.size() + bus_slaves.size());
+  joint_names_.clear();
+  joint_names_.reserve(axes.size());
+  for (const auto & axis : axes) {
+    motors.push_back(to_motor_config(axis));
+    joint_names_.push_back(axis.joint_name);
+  }
+  for (const auto & slave : bus_slaves) {
+    motors.push_back(to_motor_config(slave));
+  }
+  force_sensor_slave_index_ = -1;
+  for (std::size_t i = 0; i < motors.size(); ++i) {
+    if (motors[i].pdo_layout == ethercat_joint::PdoLayout::SRI_M8126) {
+      if (force_sensor_slave_index_ >= 0) {
+        error = "map_joints: multiple SRI M8126 force sensors are not supported";
+        mapped_ = false;
+        return false;
+      }
+      force_sensor_slave_index_ = static_cast<int32_t>(i);
+    }
+  }
+  if (!servo_->initialize(motors)) {
+    error = "IgH EtherCATServo::initialize failed";
+    mapped_ = false;
+    return false;
+  }
+  axes_ = axes;
+  mapped_ = true;
+  error.clear();
+  return true;
+}
+
+bool Master::read_force_sensor(ethercat_joint::ForceSensorSample & sample) const noexcept
+{
+  sample = {};
+  if (!servo_ || force_sensor_slave_index_ < 0) {
+    return false;
+  }
+  return servo_->getForceSensorSample(
+    static_cast<uint8_t>(force_sensor_slave_index_), sample);
+}
+
+int32_t Master::force_sensor_slave_index() const noexcept
+{
+  return force_sensor_slave_index_;
+}
 
 Master::Master(unsigned int master_index, MotionPolicy policy)
 : servo_(std::make_unique<ethercat_joint::EtherCATServo>(master_index)),
@@ -42,59 +162,6 @@ bool Master::init(std::string & error)
   }
   // IgH master request happens inside EtherCATServo::initialize.
   initialized_ = true;
-  error.clear();
-  return true;
-}
-
-bool Master::map_joints(const std::vector<AxisConfig> & axes, std::string & error)
-{
-  if (!servo_) {
-    error = "map_joints: master has been shut down";
-    return false;
-  }
-  const auto validation = validate_axis_configs(axes);
-  if (validation != AxisConfigError::None) {
-    error = "map_joints: invalid axis configuration (" +
-      std::to_string(static_cast<unsigned>(validation)) + ")";
-    return false;
-  }
-  std::vector<ethercat_joint::MotorConfig> motors;
-  motors.reserve(axes.size());
-  joint_names_.clear();
-  joint_names_.reserve(axes.size());
-  for (const auto & axis : axes) {
-    ethercat_joint::MotorConfig motor;
-    motor.alias = axis.alias;
-    motor.position = axis.position;
-    motor.vendor_id = axis.vendor_id;
-    motor.product_code = axis.product_code;
-    motor.name = axis.joint_name;
-    motor.model_id = axis.model_id;
-    switch (axis.pdo_layout) {
-      case PdoLayout::JointModule:
-        motor.pdo_layout = ethercat_joint::PdoLayout::JOINT_MODULE;
-        break;
-      case PdoLayout::Gateway:
-        motor.pdo_layout = ethercat_joint::PdoLayout::GATEWAY;
-        break;
-      case PdoLayout::CoolDriveJmdt:
-        motor.pdo_layout = ethercat_joint::PdoLayout::COOLDRIVE_JMDT;
-        break;
-      case PdoLayout::Unknown:
-      default:
-        motor.pdo_layout = ethercat_joint::PdoLayout::UNKNOWN;
-        break;
-    }
-    motors.push_back(motor);
-    joint_names_.push_back(axis.joint_name);
-  }
-  if (!servo_->initialize(motors)) {
-    error = "IgH EtherCATServo::initialize failed";
-    mapped_ = false;
-    return false;
-  }
-  axes_ = axes;
-  mapped_ = true;
   error.clear();
   return true;
 }

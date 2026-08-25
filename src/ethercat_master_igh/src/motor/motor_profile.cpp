@@ -134,6 +134,36 @@ const std::vector<MotorProfile> kProfiles = {
         true,     // require_interpolation_period_gate: 校验/下载 0x60C2 对齐 2ms 总线（尝试解决 0xFF51）
         0x80,     // fault_reset_control_word: 天机需纯 0x80（0x86 不被接受，0xFF51 Fault 清不掉）
     },
+    {
+        "SRI-M8126f32",
+        "宇立 SRI M8126f32 六维力信号处理器（PDO REAL）",
+        {
+            {0x00000E53, 0x00081261},
+        },
+        PdoLayout::SRI_M8126,
+        MotorKinematicsParams{},
+        0.0,
+        0U,
+        0U,
+        0x0000U,  // SM 同步；传感器无需电机 DC
+        false,
+        0x86,
+    },
+    {
+        "SRI-M8126i32",
+        "宇立 SRI M8126i32 六维力信号处理器（PDO DINT）",
+        {
+            {0x00000E53, 0x00081260},
+        },
+        PdoLayout::SRI_M8126,
+        MotorKinematicsParams{},
+        0.0,
+        0U,
+        0U,
+        0x0000U,
+        false,
+        0x86,
+    },
 };
 
 bool identityEqual(const SlaveIdentity& a, const SlaveIdentity& b)
@@ -190,7 +220,8 @@ std::vector<SlaveIdentity> MotorProfileRegistry::allMotorIdentities()
 
 bool MotorProfileRegistry::isKnownMotor(uint32_t vendor_id, uint32_t product_code)
 {
-    return findByIdentity(vendor_id, product_code) != nullptr;
+    const MotorProfile* profile = findByIdentity(vendor_id, product_code);
+    return profile != nullptr && profile->pdo_layout != PdoLayout::SRI_M8126;
 }
 
 const char* MotorProfileRegistry::pdoLayoutName(PdoLayout layout)
@@ -199,6 +230,7 @@ const char* MotorProfileRegistry::pdoLayoutName(PdoLayout layout)
         case PdoLayout::JOINT_MODULE: return "joint_module";
         case PdoLayout::GATEWAY: return "gateway";
         case PdoLayout::COOLDRIVE_JMDT: return "cooldrive_jmdt";
+        case PdoLayout::SRI_M8126: return "sri_m8126";
         default: return "unknown";
     }
 }

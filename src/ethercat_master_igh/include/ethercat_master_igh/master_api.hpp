@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "ethercat_master_igh/motion_policy.hpp"
+#include "ethercat_joint/force_sensor/force_sensor.hpp"
 
 namespace ethercat_joint
 {
@@ -30,6 +31,7 @@ enum class PdoLayout : uint8_t
   JointModule = 1,
   Gateway = 2,
   CoolDriveJmdt = 3,
+  SriM8126 = 4,
 };
 
 struct AxisConfig
@@ -56,7 +58,7 @@ enum class AxisConfigError : uint8_t
 inline AxisConfigError validate_axis_configs(
   const std::vector<AxisConfig> & axes) noexcept
 {
-  if (axes.empty() || axes.size() > 7U) {
+  if (axes.size() > 7U) {
     return AxisConfigError::AxisCountOutOfRange;
   }
   for (std::size_t axis = 0; axis < axes.size(); ++axis) {
@@ -155,6 +157,10 @@ public:
 
   bool init(std::string & error);
   bool map_joints(const std::vector<AxisConfig> & axes, std::string & error);
+  bool map_joints(
+    const std::vector<AxisConfig> & axes,
+    const std::vector<AxisConfig> & bus_slaves,
+    std::string & error);
   /// activate() then start hard-RT Job.
   /// Startup evidence gate and external CST command-freshness watchdog are implemented.
   bool start(std::string & error);
@@ -201,6 +207,11 @@ public:
   std::size_t axis_count() const { return axes_.size(); }
   const std::vector<std::string> & joint_names() const { return joint_names_; }
 
+  /** 读取首个 SRI M8126 从站快照；无传感器或未映射时 valid=false。 */
+  bool read_force_sensor(ethercat_joint::ForceSensorSample & sample) const noexcept;
+  /** 总线从站索引；-1 表示未配置。 */
+  int32_t force_sensor_slave_index() const noexcept;
+
   ethercat_joint::EtherCATServo & servo();
   const ethercat_joint::EtherCATServo & servo() const;
 
@@ -214,6 +225,7 @@ private:
   MotionPolicy motion_policy_{MotionPolicy::ObservationOnly};
   bool startup_evidence_passed_{false};
   bool motion_commands_authorized_{false};
+  int32_t force_sensor_slave_index_{-1};
 };
 
 }  // namespace ethercat_master_igh

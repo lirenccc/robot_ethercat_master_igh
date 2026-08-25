@@ -17,6 +17,7 @@
 #include <deque>
 #include <memory>
 #include "ethercat_joint/master/igh/ethercat_sync.hpp"
+#include "ethercat_joint/force_sensor/force_sensor.hpp"
 #include "ethercat_joint/motor/motor_profile.hpp"
 #include "ethercat_joint/diagnostics/runtime_logger.hpp"
 #include "ethercat_joint/servo/cia402.hpp"
@@ -333,6 +334,14 @@ public:
      * @return SJD17 映射时为 raw；NH17 等未映射时恒为 0
      */
     int32_t getMotorEncoder2021(uint8_t motor_id) const;
+
+    /**
+     * @brief 读取 SRI M8126 六维力传感器 PDO 缓存快照
+     * @param slave_id 从站索引（须为 SRI_M8126 布局）
+     * @param out 输出采样（SI：N / N·m）
+     * @return 有效采样返回 true
+     */
+    bool getForceSensorSample(uint8_t slave_id, ForceSensorSample& out) const;
     
     /**
      * @brief 获取目标力矩（从 pending_commands 缓冲区）
@@ -516,6 +525,18 @@ private:
         unsigned int rs485_2_rx_data;      // RS485_2接收数据 (0x2004:02)
         unsigned int rs485_2_tx_length;    // RS485_2发送长度 (0x2005:01)
         unsigned int rs485_2_tx_data;      // RS485_2发送数据 (0x2005:02)
+
+        // SRI M8126 六维力传感器
+        unsigned int sri_data_no;
+        unsigned int sri_fx;
+        unsigned int sri_fy;
+        unsigned int sri_fz;
+        unsigned int sri_mx;
+        unsigned int sri_my;
+        unsigned int sri_mz;
+        unsigned int sri_para1;
+        unsigned int sri_para2;
+        unsigned int sri_para3;
     };
     std::vector<PDOOffsets> pdo_offsets_;
     
@@ -634,6 +655,26 @@ private:
         }
     };
     std::vector<GatewayData> gateway_data_;  // 每个网关一个数据缓存
+
+    struct ForceSensorCache {
+        uint16_t data_no{0};
+        float fx{0.f};
+        float fy{0.f};
+        float fz{0.f};
+        float mx{0.f};
+        float my{0.f};
+        float mz{0.f};
+        int32_t fx_i{0};
+        int32_t fy_i{0};
+        int32_t fz_i{0};
+        int32_t mx_i{0};
+        int32_t my_i{0};
+        int32_t mz_i{0};
+        bool use_float{false};
+        bool valid{false};
+    };
+    std::vector<ForceSensorCache> force_sensor_cache_;
+    std::vector<bool> sri_use_float_;
     
     // 控制字写入缓存和验证机制
     std::vector<uint16_t> pending_control_words_;      // 待写入的控制字（确保cyclic循环会写入）

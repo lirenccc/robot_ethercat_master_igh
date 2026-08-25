@@ -31,6 +31,8 @@ namespace {
 
 constexpr uint32_t kGatewayVendorId = 0x00000130;
 constexpr uint32_t kGatewayProductCode = 0x01300060;
+constexpr uint32_t kSriVendorId = 0x00000E53;
+constexpr uint32_t kSriProductF32 = 0x00081261;
 // 三木禾 SJD-17：不读 SDO 运动学，编码器在减速器输出端（19bit=524288，位置减速比 1）
 constexpr uint32_t kSjd17VendorId = 0x000009CF;
 constexpr uint32_t kSjd17ProductCode = 0x00010001;
@@ -56,6 +58,9 @@ inline const char* deviceTypeName(const MotorConfig& cfg) noexcept
 {
     if (cfg.vendor_id == kGatewayVendorId && cfg.product_code == kGatewayProductCode) {
         return "网关";
+    }
+    if (cfg.pdo_layout == PdoLayout::SRI_M8126) {
+        return "宇立 SRI M8126";
     }
     if (cfg.pdo_layout == PdoLayout::COOLDRIVE_JMDT) {
         return "天机 JMDT 关节模组";
@@ -126,6 +131,29 @@ bool dcSync0MatchesBus(const MotorConfig & cfg, uint32_t bus_cycle_ns)
 inline bool isGateway(const MotorConfig& cfg)
 {
     return cfg.vendor_id == kGatewayVendorId && cfg.product_code == kGatewayProductCode;
+}
+
+inline bool isSriM8126(const MotorConfig& cfg)
+{
+    return cfg.pdo_layout == PdoLayout::SRI_M8126;
+}
+
+inline bool isSriM8126F32(const MotorConfig& cfg)
+{
+    return cfg.vendor_id == kSriVendorId && cfg.product_code == kSriProductF32;
+}
+
+inline bool isNonMotionSlave(const MotorConfig& cfg)
+{
+    return isGateway(cfg) || isSriM8126(cfg);
+}
+
+inline float readFloatLe(const uint8_t* pd)
+{
+    uint32_t bits = EC_READ_U32(pd);
+    float value = 0.f;
+    std::memcpy(&value, &bits, sizeof(value));
+    return value;
 }
 
 inline double pulseToDegree(int32_t pulse, size_t motor_id)
@@ -231,6 +259,11 @@ bool EtherCATServo::initialize(const std::vector<MotorConfig>& motor_configs)
     slave_configs_.resize(motor_count_);  // ⭐ motor_count_已经包括网关（=8）
     pdo_offsets_.resize(motor_count_);
     gateway_data_.resize(motor_count_);  // 初始化网关数据缓存（每个从站一个，只有网关会使用）
+    force_sensor_cache_.resize(motor_count_);
+    sri_use_float_.resize(motor_count_, false);
+    for (size_t i = 0; i < motor_count_; ++i) {
+        sri_use_float_[i] = isSriM8126F32(motor_configs_[i]);
+    }
     
     std::cout << "[IgH] configuring " << motor_count_ << " slaves" << std::endl;
 
@@ -258,9 +291,6 @@ bool EtherCATServo::initialize(const std::vector<MotorConfig>& motor_configs)
     for (size_t i = 0; i < motor_count_; ++i) {
         const auto& cfg = motor_configs_[i];
         
-        // 仅通过 VID/PID 识别网关（勿用“最后一个从站”，避免末轴误判）
-        const bool is_gateway = (cfg.vendor_id == kGatewayVendorId &&
-                                 cfg.product_code == kGatewayProductCode);
         const char* device_type = deviceTypeName(cfg);
         
         // ⭐ 所有从站（包含网关）都必须调用 slave_config
@@ -277,8 +307,8 @@ bool EtherCATServo::initialize(const std::vector<MotorConfig>& motor_configs)
             return false;
         }
         
-        // 只把"第一个电机"作为 DC 参考时钟，网关不作为参考时钟
-        if (!is_gateway && ref_slave_config == nullptr) {
+        // 只把"第一个电机"作为 DC 参考时钟，网关/力传感器不作为参考时钟
+        if (!isNonMotionSlave(cfg) && ref_slave_config == nullptr) {
             ref_slave_config = slave_configs_[i];
             ref_slave_index = static_cast<int>(i);
         }
@@ -444,7 +474,7 @@ bool EtherCATServo::initialize(const std::vector<MotorConfig>& motor_configs)
             params[i] = profile ? profile->kinematics : MotorKinematics::get(i);
         }
         MotorKinematics::setParams(params);
-        if (motor_count_ > 0 && !isGateway(motor_configs_[0])) {
+        if (motor_count_ > 0 && !isNonMotionSlave(motor_configs_[0])) {
             std::cout << "[IgH] kinematics[0]: " << MotorKinematics::describe(0) << std::endl;
         }
     }
@@ -568,8 +598,8 @@ bool EtherCATServo::dcSyncWarmup(uint32_t duration_ms)
         //    操作模式=CSP、目标=空闲位置
         for (size_t i = 0; i < motor_count_; ++i) {
             const auto& offsets = pdo_offsets_[i];
-            if (isGateway(motor_configs_[i])) {
-                continue;  // 网关跳过（无关节 PDO）
+            if (isNonMotionSlave(motor_configs_[i])) {
+                continue;  // 网关/力传感器跳过（无关节 PDO）
             }
             EC_WRITE_U16(domain_out_pd_ + offsets.control_word, CONTROL_WORD_SWITCH_ON);
             if (offsets.operation_mode != 0) {
@@ -634,7 +664,7 @@ bool EtherCATServo::verifyPdoEvidence(size_t motor_id) const
     if (motor_id >= motor_count_) {
         return false;
     }
-    if (isGateway(motor_configs_[motor_id])) {
+    if (isNonMotionSlave(motor_configs_[motor_id])) {
         return true;
     }
 
@@ -669,7 +699,7 @@ bool EtherCATServo::verifyInterpolationPeriodGate()
     const auto expected = encodeCspInterpolationPeriod(bus_cycle_ns);
 
     for (size_t i = 0; i < motor_count_; ++i) {
-        if (isGateway(motor_configs_[i])) {
+        if (isNonMotionSlave(motor_configs_[i])) {
             continue;
         }
         const MotorProfile* profile = nullptr;
@@ -1327,6 +1357,63 @@ bool EtherCATServo::configurePDOMapping()
             std::cout << "========================================" << std::endl;
             continue;
         }
+
+        if (isSriM8126(cfg)) {
+            const bool use_f32 = isSriM8126F32(cfg);
+            std::cout << "  ▶ SRI M8126 PDO 0x1601/0x"
+                      << (use_f32 ? "1A03" : "1A02")
+                      << " (" << (use_f32 ? "REAL" : "DINT") << ")" << std::endl;
+
+            static const ec_pdo_entry_info_t sri_rx_entries[] = {
+                {0x7010, 0x01, 16},
+                {0x7010, 0x02, 16},
+                {0x7010, 0x03, 16},
+            };
+            static const ec_pdo_entry_info_t sri_tx_f32_entries[] = {
+                {0x6030, 0x01, 16},
+                {0x6030, 0x02, 32},
+                {0x6030, 0x03, 32},
+                {0x6030, 0x04, 32},
+                {0x6030, 0x05, 32},
+                {0x6030, 0x06, 32},
+                {0x6030, 0x07, 32},
+            };
+            static const ec_pdo_entry_info_t sri_tx_i32_entries[] = {
+                {0x6020, 0x01, 16},
+                {0x6020, 0x02, 32},
+                {0x6020, 0x03, 32},
+                {0x6020, 0x04, 32},
+                {0x6020, 0x05, 32},
+                {0x6020, 0x06, 32},
+                {0x6020, 0x07, 32},
+            };
+            static const ec_pdo_info_t sri_rx_pdos[] = {
+                {0x1601, 3, sri_rx_entries},
+            };
+            static const ec_pdo_info_t sri_tx_f32_pdos[] = {
+                {0x1A03, 7, sri_tx_f32_entries},
+            };
+            static const ec_pdo_info_t sri_tx_i32_pdos[] = {
+                {0x1A02, 7, sri_tx_i32_entries},
+            };
+            const ec_pdo_info_t* sri_tx_pdos =
+                use_f32 ? sri_tx_f32_pdos : sri_tx_i32_pdos;
+            const ec_sync_info_t sri_syncs[] = {
+                {2, EC_DIR_OUTPUT, 1, sri_rx_pdos, EC_WD_ENABLE},
+                {3, EC_DIR_INPUT,  1, sri_tx_pdos, EC_WD_DISABLE},
+                {0xFF, EC_DIR_INVALID, 0, nullptr, EC_WD_DISABLE},
+            };
+
+            if (ecrt_slave_config_pdos(slave_configs_[i], EC_END, sri_syncs) != 0) {
+                std::cerr << "❌ Failed to configure PDOs for SRI M8126 " << i << std::endl;
+                return false;
+            }
+            std::cout << "  ✓ RxPDO (0x1601): 7010 Para1-3" << std::endl;
+            std::cout << "  ✓ TxPDO (0x"
+                      << (use_f32 ? "1A03" : "1A02") << "): DataNo + Fx..Mz"
+                      << std::endl;
+            continue;
+        }
         
         // 配置电机PDO
         std::cerr << "❌ 未支持的关节模组 PDO 布局: " << cfg.name
@@ -1626,7 +1713,78 @@ bool EtherCATServo::registerPDOEntries()
             
             std::cout << "  注意: 已注册网关所有PDO条目（ID、长度、数据字段），数据长度和内容将在循环中写入/读取0值" << std::endl;
             std::cout << "Gateway " << i << " PDO registration completed (all fields registered, data = 0)." << std::endl;
-            continue;  // 跳过后续的电机PDO注册
+            continue;
+        }
+
+        if (isSriM8126(cfg)) {
+            const bool use_f32 = sri_use_float_[i];
+            std::cout << "\n[SRI M8126] Register PDO slave " << i
+                      << " (" << (use_f32 ? "f32/0x6030" : "i32/0x6020") << ")" << std::endl;
+
+            if (!slave_configs_[i]) {
+                std::cerr << "❌ SRI M8126 slave " << i << " config missing" << std::endl;
+                return false;
+            }
+
+            memset(&offsets, 0, sizeof(PDOOffsets));
+            offsets.sri_data_no = kPdoOffsetUnset;
+            offsets.sri_fx = kPdoOffsetUnset;
+            offsets.sri_fy = kPdoOffsetUnset;
+            offsets.sri_fz = kPdoOffsetUnset;
+            offsets.sri_mx = kPdoOffsetUnset;
+            offsets.sri_my = kPdoOffsetUnset;
+            offsets.sri_mz = kPdoOffsetUnset;
+            offsets.sri_para1 = kPdoOffsetUnset;
+            offsets.sri_para2 = kPdoOffsetUnset;
+            offsets.sri_para3 = kPdoOffsetUnset;
+
+            auto reg_out = [&](uint16_t index, uint8_t subindex, unsigned int& slot) -> bool {
+                const int ret = ecrt_slave_config_reg_pdo_entry(
+                    slave_configs_[i], index, subindex, domain_out_, nullptr);
+                if (ret < 0) {
+                    std::cerr << "❌ SRI Rx register failed 0x" << std::hex << index
+                              << ":" << static_cast<int>(subindex) << std::dec << std::endl;
+                    return false;
+                }
+                slot = static_cast<unsigned int>(ret);
+                return true;
+            };
+            auto reg_in = [&](uint16_t index, uint8_t subindex, unsigned int& slot) -> bool {
+                const int ret = ecrt_slave_config_reg_pdo_entry(
+                    slave_configs_[i], index, subindex, domain_in_, nullptr);
+                if (ret < 0) {
+                    std::cerr << "❌ SRI Tx register failed 0x" << std::hex << index
+                              << ":" << static_cast<int>(subindex) << std::dec << std::endl;
+                    return false;
+                }
+                slot = static_cast<unsigned int>(ret);
+                return true;
+            };
+
+            if (!reg_out(0x7010, 0x01, offsets.sri_para1) ||
+                !reg_out(0x7010, 0x02, offsets.sri_para2) ||
+                !reg_out(0x7010, 0x03, offsets.sri_para3))
+            {
+                return false;
+            }
+
+            const uint16_t tx_index = use_f32 ? 0x6030U : 0x6020U;
+            if (!reg_in(tx_index, 0x01, offsets.sri_data_no) ||
+                !reg_in(tx_index, 0x02, offsets.sri_fx) ||
+                !reg_in(tx_index, 0x03, offsets.sri_fy) ||
+                !reg_in(tx_index, 0x04, offsets.sri_fz) ||
+                !reg_in(tx_index, 0x05, offsets.sri_mx) ||
+                !reg_in(tx_index, 0x06, offsets.sri_my) ||
+                !reg_in(tx_index, 0x07, offsets.sri_mz))
+            {
+                return false;
+            }
+
+            if (!verifyPdoEvidence(i)) {
+                return false;
+            }
+            std::cout << "  ✓ SRI M8126 PDO registration completed" << std::endl;
+            continue;
         }
         
         // ⭐ 关节模组 PDO 注册（IgH JOINT_MODULE；SJD17 ENI 与此一致）
@@ -2025,7 +2183,6 @@ void EtherCATServo::receiveData()
             const auto& cfg = motor_configs_[i];
             const auto& offsets = pdo_offsets_[i];
             
-            // ⭐ 检查是否是网关：仅通过 VID/PID 识别
             bool is_gateway = (cfg.vendor_id == kGatewayVendorId && cfg.product_code == kGatewayProductCode);
             
             if (is_gateway) {
@@ -2065,6 +2222,33 @@ void EtherCATServo::receiveData()
                 }
                 
                 // ⭐ 网关不需要缓存电机相关的数据，跳过
+                continue;
+            }
+
+            if (isSriM8126(cfg)) {
+                ForceSensorCache& fc = force_sensor_cache_[i];
+                fc.use_float = sri_use_float_[i];
+                if (offsets.sri_data_no != kPdoOffsetUnset) {
+                    fc.data_no = EC_READ_U16(domain_in_pd_ + offsets.sri_data_no);
+                }
+                if (fc.use_float) {
+                    if (offsets.sri_fx != kPdoOffsetUnset) {
+                        fc.fx = readFloatLe(domain_in_pd_ + offsets.sri_fx);
+                        fc.fy = readFloatLe(domain_in_pd_ + offsets.sri_fy);
+                        fc.fz = readFloatLe(domain_in_pd_ + offsets.sri_fz);
+                        fc.mx = readFloatLe(domain_in_pd_ + offsets.sri_mx);
+                        fc.my = readFloatLe(domain_in_pd_ + offsets.sri_my);
+                        fc.mz = readFloatLe(domain_in_pd_ + offsets.sri_mz);
+                    }
+                } else if (offsets.sri_fx != kPdoOffsetUnset) {
+                    fc.fx_i = EC_READ_S32(domain_in_pd_ + offsets.sri_fx);
+                    fc.fy_i = EC_READ_S32(domain_in_pd_ + offsets.sri_fy);
+                    fc.fz_i = EC_READ_S32(domain_in_pd_ + offsets.sri_fz);
+                    fc.mx_i = EC_READ_S32(domain_in_pd_ + offsets.sri_mx);
+                    fc.my_i = EC_READ_S32(domain_in_pd_ + offsets.sri_my);
+                    fc.mz_i = EC_READ_S32(domain_in_pd_ + offsets.sri_mz);
+                }
+                fc.valid = offsets.sri_data_no != kPdoOffsetUnset;
                 continue;
             }
             
@@ -2159,7 +2343,6 @@ void EtherCATServo::sendData()
         const auto& cfg = motor_configs_[i];
         const auto& offsets = pdo_offsets_[i];
         
-        // ⭐ 检查是否是网关：仅通过 VID/PID 识别
         bool is_gateway = (cfg.vendor_id == kGatewayVendorId && cfg.product_code == kGatewayProductCode);
         
         if (is_gateway) {
@@ -2198,6 +2381,19 @@ void EtherCATServo::sendData()
             
             // ⭐ 注意：接收长度字段（网关发送给主站）在receiveData()中读取，这里不需要处理
             continue;  // 跳过后续的电机处理
+        }
+
+        if (isSriM8126(cfg)) {
+            if (offsets.sri_para1 != kPdoOffsetUnset) {
+                EC_WRITE_S16(domain_out_pd_ + offsets.sri_para1, 0);
+            }
+            if (offsets.sri_para2 != kPdoOffsetUnset) {
+                EC_WRITE_S16(domain_out_pd_ + offsets.sri_para2, 0);
+            }
+            if (offsets.sri_para3 != kPdoOffsetUnset) {
+                EC_WRITE_S16(domain_out_pd_ + offsets.sri_para3, 0);
+            }
+            continue;
         }
         
         // 电机处理（前7个电机）
@@ -2615,8 +2811,7 @@ bool EtherCATServo::setEnable(uint8_t motor_id, bool enable)
         // Broadcast: all motors, skip gateway VID/PID.
         bool any_change = false;
         for (size_t i = 0; i < motor_count_; ++i) {
-            const auto& cfg = motor_configs_[i];
-            if (cfg.vendor_id == kGatewayVendorId && cfg.product_code == kGatewayProductCode) {
+            if (isNonMotionSlave(motor_configs_[i])) {
                 continue;
             }
             if (desired_enable_[i] != enable) {
@@ -2630,8 +2825,7 @@ bool EtherCATServo::setEnable(uint8_t motor_id, bool enable)
             return true;
         }
         for (size_t i = 0; i < motor_count_; ++i) {
-            const auto& cfg = motor_configs_[i];
-            if (cfg.vendor_id == kGatewayVendorId && cfg.product_code == kGatewayProductCode) {
+            if (isNonMotionSlave(motor_configs_[i])) {
                 continue;
             }
             desired_enable_[i] = enable;
@@ -2640,6 +2834,9 @@ bool EtherCATServo::setEnable(uint8_t motor_id, bool enable)
             enable_fsm_wait_[i] = 0;
         }
     } else if (motor_id < motor_count_) {
+        if (isNonMotionSlave(motor_configs_[motor_id])) {
+            return true;
+        }
         // 幂等：同上；仅在使能状态变化时启动/重置 FSM
         if (desired_enable_[motor_id] == enable) {
             return true;
@@ -2678,7 +2875,7 @@ bool EtherCATServo::requestFaultReset(uint8_t motor_id, bool allow_without_fault
 
     bool selected_fault_present = false;
     for (size_t i = 0; i < motor_count_; ++i) {
-        if (isGateway(motor_configs_[i]) ||
+        if (isNonMotionSlave(motor_configs_[i]) ||
             (motor_id != 0xFFU && motor_id != static_cast<uint8_t>(i)))
         {
             continue;
@@ -2720,16 +2917,15 @@ bool EtherCATServo::setOperationMode(uint8_t motor_id, OperationMode mode)
         }
     };
 
-    auto is_gw = [this](size_t i) {
-        const auto & cfg = motor_configs_[i];
-        return cfg.vendor_id == kGatewayVendorId && cfg.product_code == kGatewayProductCode;
+    auto skip_non_motion = [this](size_t idx) {
+        return isNonMotionSlave(motor_configs_[idx]);
     };
 
     // 幂等：已在目标模式则跳过（Master::cycle 每拍都会调用）
     if (motor_id == 0xFF) {
         bool all_same = true;
         for (size_t i = 0; i < motor_count_; ++i) {
-            if (is_gw(i)) {
+            if (skip_non_motion(i)) {
                 continue;
             }
             if (i >= current_modes_.size() || current_modes_[i] != mode) {
@@ -2746,7 +2942,7 @@ bool EtherCATServo::setOperationMode(uint8_t motor_id, OperationMode mode)
 
     // RT 安全：切模式时不关使能、不 sleep。切入 CSP 时对齐 0x607A/idle 到实际位。
     auto apply_axis = [&](size_t i) {
-        if (is_gw(i) || i >= current_modes_.size()) {
+        if (skip_non_motion(i) || i >= current_modes_.size()) {
             return;
         }
         const OperationMode previous = current_modes_[i];
@@ -2803,7 +2999,7 @@ bool EtherCATServo::setOperationMode(uint8_t motor_id, OperationMode mode)
 
 OperationMode EtherCATServo::getOperationMode(uint8_t motor_id) const
 {
-    if (motor_id >= motor_count_ || isGateway(motor_configs_[motor_id])) {
+    if (motor_id >= motor_count_ || isNonMotionSlave(motor_configs_[motor_id])) {
         return OperationMode::NONE;
     }
     return current_modes_[motor_id];
@@ -2941,6 +3137,39 @@ int32_t EtherCATServo::getSensorForce2020(uint8_t motor_id) const
 int32_t EtherCATServo::getMotorEncoder2021(uint8_t motor_id) const
 {
     return seqlockReadIndex(pdo_cache_seq_, last_motor_encoder_2021_, motor_id, int32_t{0});
+}
+
+bool EtherCATServo::getForceSensorSample(uint8_t slave_id, ForceSensorSample& out) const
+{
+    out = {};
+    if (slave_id >= motor_count_ || !isSriM8126(motor_configs_[slave_id])) {
+        return false;
+    }
+
+    const ForceSensorCache cache =
+        seqlockReadIndex(pdo_cache_seq_, force_sensor_cache_, slave_id, ForceSensorCache{});
+    if (!cache.valid) {
+        return false;
+    }
+
+    out.data_no = cache.data_no;
+    if (cache.use_float) {
+        out.fx = static_cast<double>(cache.fx);
+        out.fy = static_cast<double>(cache.fy);
+        out.fz = static_cast<double>(cache.fz);
+        out.mx = static_cast<double>(cache.mx);
+        out.my = static_cast<double>(cache.my);
+        out.mz = static_cast<double>(cache.mz);
+    } else {
+        out.fx = sriM8126Int32ToSi(cache.fx_i);
+        out.fy = sriM8126Int32ToSi(cache.fy_i);
+        out.fz = sriM8126Int32ToSi(cache.fz_i);
+        out.mx = sriM8126Int32ToSi(cache.mx_i);
+        out.my = sriM8126Int32ToSi(cache.my_i);
+        out.mz = sriM8126Int32ToSi(cache.mz_i);
+    }
+    out.valid = true;
+    return true;
 }
 
 int16_t EtherCATServo::getTargetTorque(uint8_t motor_id) const
@@ -3447,8 +3676,8 @@ bool EtherCATServo::initializePositionsFromSDO()
     for (size_t i = 0; i < motor_count_; ++i) {
         const auto& cfg = motor_configs_[i];
         
-        // 跳过网关
-        if (cfg.vendor_id == kGatewayVendorId && cfg.product_code == kGatewayProductCode) {
+        // 跳过网关与力传感器
+        if (isNonMotionSlave(cfg)) {
             continue;
         }
         
@@ -3576,7 +3805,7 @@ bool EtherCATServo::tryLoadKinematicsFromSdo()
         params[i] = MotorKinematics::get(i);
         const auto& cfg = motor_configs_[i];
 
-        if (cfg.vendor_id == kGatewayVendorId && cfg.product_code == kGatewayProductCode) {
+        if (isNonMotionSlave(cfg)) {
             continue;
         }
 
@@ -3650,7 +3879,7 @@ bool EtherCATServo::tryLoadKinematicsFromSdo()
 
     if (updated) {
         MotorKinematics::setParams(params);
-        if (motor_count_ > 0 && !isGateway(motor_configs_[0])) {
+        if (motor_count_ > 0 && !isNonMotionSlave(motor_configs_[0])) {
             std::cout << "[IgH] kinematics applied[0]: " << MotorKinematics::describe(0)
                       << std::endl;
         }
@@ -3677,7 +3906,7 @@ uint16_t EtherCATServo::readErrorCode(uint8_t motor_id) const
     }
 
     const auto& cfg = motor_configs_[motor_id];
-    if (cfg.vendor_id == kGatewayVendorId && cfg.product_code == kGatewayProductCode) {
+    if (isNonMotionSlave(cfg)) {
         return 0;
     }
 
@@ -3809,7 +4038,7 @@ void EtherCATServo::checkExternalCommandFreshness()
     bool stale = false;
 
     for (size_t i = 0; i < motor_count_; ++i) {
-        if (isGateway(motor_configs_[i])) {
+        if (isNonMotionSlave(motor_configs_[i])) {
             continue;
         }
         if (current_modes_[i] == OperationMode::CYCLIC_SYNC_TORQUE &&
@@ -3844,7 +4073,7 @@ void EtherCATServo::applyCommandContentionFallback()
         return;
     }
     for (size_t i = 0; i < motor_count_; ++i) {
-        if (isGateway(motor_configs_[i])) {
+        if (isNonMotionSlave(motor_configs_[i])) {
             continue;
         }
         if (current_modes_[i] == OperationMode::CYCLIC_SYNC_TORQUE &&
@@ -3922,7 +4151,7 @@ void EtherCATServo::applySafeProcessImageOutputs()
 
     for (size_t i = 0; i < motor_count_; ++i) {
         const auto & cfg = motor_configs_[i];
-        if (cfg.vendor_id == kGatewayVendorId && cfg.product_code == kGatewayProductCode) {
+        if (isNonMotionSlave(cfg)) {
             continue;
         }
         const auto & offsets = pdo_offsets_[i];

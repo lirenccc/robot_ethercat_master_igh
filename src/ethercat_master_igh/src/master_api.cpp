@@ -142,6 +142,7 @@ int32_t Master::force_sensor_slave_index() const noexcept
 
 Master::Master(unsigned int master_index, MotionPolicy policy)
 : servo_(std::make_unique<ethercat_joint::EtherCATServo>(master_index)),
+  master_index_(master_index),
   motion_policy_(policy)
 {
 }
@@ -202,7 +203,7 @@ bool Master::start(std::string & error)
     return false;
   }
 
-  if (!ethercat_joint::IghMasterRuntime::instance().start(servo_.get())) {
+  if (!ethercat_joint::IghMasterRuntime::forIndex(master_index_).start(servo_.get())) {
     error = "IgH hard-RT Job start failed (check IGH_REQUIRE_REALTIME / privileges)";
     servo_->deactivate();
     return false;
@@ -223,7 +224,7 @@ bool Master::start(std::string & error)
       last_log = now;
       const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         now - (op_deadline - kOpWait)).count();
-      const auto diag = ethercat_joint::IghMasterRuntime::instance().jobCycleDiag();
+      const auto diag = ethercat_joint::IghMasterRuntime::forIndex(master_index_).jobCycleDiag();
       std::cout << "[IgH] OP wait @" << elapsed_ms
                 << "ms (rx_ok=" << diag.last_rx_ok
                 << " dc_dev=" << diag.dc_deviation_ns << ")" << std::endl;
@@ -234,7 +235,7 @@ bool Master::start(std::string & error)
     error = "IgH slaves did not reach OP within 60s after Job start (WC/AL stuck)";
     std::cerr << "[IgH] " << error << std::endl;
     servo_->diagnoseSlaveAlStates();
-    ethercat_joint::IghMasterRuntime::instance().stop();
+    ethercat_joint::IghMasterRuntime::forIndex(master_index_).stop();
     servo_->deactivate();
     running_ = false;
     return false;
@@ -251,7 +252,7 @@ bool Master::start(std::string & error)
     const auto deadline = std::chrono::steady_clock::now() + kDcSettleTimeout;
     int good_streak = 0;
     while (std::chrono::steady_clock::now() < deadline) {
-      const auto diag = ethercat_joint::IghMasterRuntime::instance().jobCycleDiag();
+      const auto diag = ethercat_joint::IghMasterRuntime::forIndex(master_index_).jobCycleDiag();
       const bool settled = diag.dc_status_valid && diag.last_rx_ok != 0 &&
         (std::llabs(static_cast<long long>(diag.dc_deviation_ns)) <= kSettleAbsNs);
       if (settled) {
@@ -285,7 +286,7 @@ bool Master::start(std::string & error)
     auto fail_startup = [&](const std::string & msg) {
       error = msg;
       std::cerr << "[IgH] " << error << std::endl;
-      ethercat_joint::IghMasterRuntime::instance().stop();
+      ethercat_joint::IghMasterRuntime::forIndex(master_index_).stop();
       servo_->deactivate();
       running_ = false;
       return false;
@@ -316,7 +317,7 @@ bool Master::start(std::string & error)
               << ")" << std::endl;
   }
 
-  ethercat_joint::IghMasterRuntime::instance().setOperational(true);
+  ethercat_joint::IghMasterRuntime::forIndex(master_index_).setOperational(true);
   // 武装 anomaly 后再 reset 一次，让 healthy_dwell 从干净状态计时
   servo_->requestSafetyReset();
 

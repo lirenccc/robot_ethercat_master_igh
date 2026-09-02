@@ -694,7 +694,7 @@ bool EtherCATServo::verifyInterpolationPeriodGate()
 {
     const uint32_t bus_cycle_us = cached_bus_cycle_us_ > 0U
         ? cached_bus_cycle_us_
-        : IghMasterRuntime::instance().busCycleUs();
+        : ighRuntime().busCycleUs();
     const uint64_t bus_cycle_ns = static_cast<uint64_t>(bus_cycle_us) * 1000ULL;
     const auto expected = encodeCspInterpolationPeriod(bus_cycle_ns);
 
@@ -2010,7 +2010,7 @@ void EtherCATServo::receiveData()
     // 启动后短时诊断：观察 WC 是否正常（WC=0 时从站无法进 OP）
     // Job 线程路径禁止 cout
     if (activated_ && motor_count_ > 0 && slave_configs_[0] &&
-        !IghMasterRuntime::instance().isJobThreadRunning()) {
+        !ighRuntime().isJobThreadRunning()) {
         static unsigned int wc_diag_count = 0;
         if (wc_diag_count < 100) {
             ec_domain_state_t ds_out{};
@@ -3926,7 +3926,7 @@ uint16_t EtherCATServo::readErrorCode(uint8_t motor_id) const
 
 void EtherCATServo::deactivate()
 {
-    IghMasterRuntime::instance().stop();
+    ighRuntime().stop();
     if (master_ && activated_) {
         ecrt_master_deactivate(master_);
         domain_out_pd_ = nullptr;
@@ -3938,32 +3938,32 @@ void EtherCATServo::deactivate()
 
 bool EtherCATServo::isJobThreadRunning() const
 {
-    return IghMasterRuntime::instance().isJobThreadRunning();
+    return ighRuntime().isJobThreadRunning();
 }
 
 uint32_t EtherCATServo::busCycleUs() const
 {
-    return IghMasterRuntime::instance().busCycleUs();
+    return ighRuntime().busCycleUs();
 }
 
 bool EtherCATServo::commFault() const
 {
-    return IghMasterRuntime::instance().commFault();
+    return ighRuntime().commFault();
 }
 
 bool EtherCATServo::safeOutputRequired() const
 {
-    return IghMasterRuntime::instance().safeOutputRequired();
+    return ighRuntime().safeOutputRequired();
 }
 
 bool EtherCATServo::motionReenableAllowed() const
 {
-    return IghMasterRuntime::instance().motionReenableAllowed();
+    return ighRuntime().motionReenableAllowed();
 }
 
 void EtherCATServo::clearCommFault()
 {
-    IghMasterRuntime::instance().clearCommFault();
+    ighRuntime().clearCommFault();
     safe_output_active_ = false;
     explicit_fault_reset_cycles_.store(0U, std::memory_order_release);
     explicit_fault_reset_axis_.store(0xFFFFU, std::memory_order_release);
@@ -3972,18 +3972,18 @@ void EtherCATServo::clearCommFault()
 
 void EtherCATServo::requestSafeOutput()
 {
-    IghMasterRuntime::instance().requestSafeOutput();
+    ighRuntime().requestSafeOutput();
 }
 
 bool EtherCATServo::releaseSafeOutput()
 {
     return startup_evidence_passed_ &&
-        IghMasterRuntime::instance().releaseSafeOutput();
+        ighRuntime().releaseSafeOutput();
 }
 
 IghJobCycleDiag EtherCATServo::jobCycleDiag() const
 {
-    return IghMasterRuntime::instance().jobCycleDiag();
+    return ighRuntime().jobCycleDiag();
 }
 
 void EtherCATServo::disarmAllCommandFreshness()
@@ -4030,7 +4030,7 @@ void EtherCATServo::checkExternalCommandFreshness()
     if (!initialized_ || external_cmd_watchdog_ns_ == 0U) {
         return;
     }
-    if (IghMasterRuntime::instance().safeOutputRequired()) {
+    if (ighRuntime().safeOutputRequired()) {
         return;
     }
 
@@ -4063,7 +4063,7 @@ void EtherCATServo::checkExternalCommandFreshness()
     }
 
     if (stale) {
-        IghMasterRuntime::instance().raiseCommFault();
+        ighRuntime().raiseCommFault();
     }
 }
 
@@ -4125,7 +4125,7 @@ bool EtherCATServo::runJobCycle(bool force_safe_output, uint64_t app_time_ns)
     processSync(t);
 
     const bool safe =
-      force_safe_output || IghMasterRuntime::instance().safeOutputRequired();
+      force_safe_output || ighRuntime().safeOutputRequired();
     if (safe) {
         applySafeProcessImageOutputs();
     } else {

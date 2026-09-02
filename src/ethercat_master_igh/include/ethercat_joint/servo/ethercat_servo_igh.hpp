@@ -17,6 +17,7 @@
 #include <deque>
 #include <memory>
 #include "ethercat_joint/master/igh/ethercat_sync.hpp"
+#include "ethercat_joint/master/igh/igh_master_runtime.hpp"
 #include "ethercat_joint/force_sensor/force_sensor.hpp"
 #include "ethercat_joint/motor/motor_profile.hpp"
 #include "ethercat_joint/diagnostics/runtime_logger.hpp"
@@ -81,6 +82,13 @@ public:
      * @param master_index 主站索引（通常为 0）
      */
     explicit EtherCATServo(unsigned int master_index = 0);
+
+    unsigned int masterIndex() const noexcept { return master_index_; }
+    IghMasterRuntime & ighRuntime() { return IghMasterRuntime::forIndex(master_index_); }
+    const IghMasterRuntime & ighRuntime() const
+    {
+      return IghMasterRuntime::forIndex(master_index_);
+    }
     
     /**
      * @brief 析构函数

@@ -217,6 +217,7 @@ public:
 
 private:
   std::unique_ptr<ethercat_joint::EtherCATServo> servo_;
+  unsigned int master_index_{0};
   std::vector<AxisConfig> axes_;
   std::vector<std::string> joint_names_;
   bool initialized_{false};

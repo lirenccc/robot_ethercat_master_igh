@@ -49,7 +49,11 @@ struct IghJobCycleDiag
 class IghMasterRuntime
 {
 public:
-  static IghMasterRuntime & instance();
+  static constexpr unsigned kMaxMasters = 4;
+
+  /** Per IgH master index (0…3); each index owns an independent Job thread. */
+  static IghMasterRuntime & forIndex(unsigned master_index);
+  static IghMasterRuntime & instance() { return forIndex(0); }
 
   IghMasterRuntime(const IghMasterRuntime &) = delete;
   IghMasterRuntime & operator=(const IghMasterRuntime &) = delete;

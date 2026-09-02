@@ -48,10 +48,11 @@ void updateAtomicMax(std::atomic<uint64_t> & target, uint64_t value)
 
 }  // namespace
 
-IghMasterRuntime & IghMasterRuntime::instance()
+IghMasterRuntime & IghMasterRuntime::forIndex(unsigned master_index)
 {
-  static IghMasterRuntime runtime;
-  return runtime;
+  static IghMasterRuntime runtimes[kMaxMasters];
+  const unsigned idx = master_index < kMaxMasters ? master_index : 0u;
+  return runtimes[idx];
 }
 
 bool IghMasterRuntime::configure(const IghMasterConfig & config)
@@ -83,6 +84,10 @@ bool IghMasterRuntime::applyMemoryLock()
     std::cerr << "[IgH] IGH_LOCK_MEMORY=0: skipping mlockall" << std::endl;
     return true;
   }
+  static std::atomic<bool> process_memory_locked{false};
+  if (process_memory_locked.load(std::memory_order_acquire)) {
+    return true;
+  }
   if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
     const int err = errno;
     std::cerr << "[IgH] mlockall failed: " << std::strerror(err) << std::endl;
@@ -92,6 +97,7 @@ bool IghMasterRuntime::applyMemoryLock()
     std::cerr << "[IgH] IGH_REQUIRE_REALTIME=0: continuing without mlockall" << std::endl;
     return true;
   }
+  process_memory_locked.store(true, std::memory_order_release);
   std::cerr << "[IgH] mlockall(MCL_CURRENT|MCL_FUTURE) ok" << std::endl;
   return true;
 }

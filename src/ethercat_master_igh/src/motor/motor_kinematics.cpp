@@ -14,9 +14,15 @@ std::vector<MotorKinematicsParams> g_params{MotorKinematicsParams{}};
 
 void MotorKinematics::setParams(const std::vector<MotorKinematicsParams>& params)
 {
-    if (!params.empty()) {
-        g_params = params;
+    if (params.empty()) {
+        return;
     }
+    // Same size: in-place copy (Dual Bus RT path switches left/right each cycle).
+    if (g_params.size() == params.size()) {
+        std::copy(params.begin(), params.end(), g_params.begin());
+        return;
+    }
+    g_params = params;
 }
 
 const MotorKinematicsParams& MotorKinematics::get(size_t motor_id)

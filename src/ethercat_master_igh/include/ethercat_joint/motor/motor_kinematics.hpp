@@ -26,9 +26,10 @@ constexpr double kRadiansPerRevolution = 6.283185307179586;  // 2π，与文档 
  *   默认与位置同一 encoderFactor；
  *   NH17：即便 0x2016=0（位置外圈），速度仍为电机侧 cnt/s
  *   → Cnt/s = deg/s/360 × gear_ratio × motor_encoder_resolution
- * 力矩（输出端 Nm）：
- *   输出力矩 = permille/1000 × rated_torque_motor × torque_gear_ratio
+ * 力矩（用户系输出端 Nm，与位置/速度同一 joint_direction）：
+ *   |τ| = permille/1000 × rated_torque_motor × torque_gear_ratio
  *   （NH17 电流法：Imax × kt × torque_gear_ratio × η）
+ *   τ_user = |τ|_motor_scale × joint_direction；下发时除以 joint_direction
  * 弧度制（仅文档对照，Web/ROS 服务不使用）：
  *   内圈 Cnt = rad/6.28 × gear_ratio × encoder_resolution
  */
@@ -45,6 +46,7 @@ struct MotorKinematicsParams {
     double torque_constant_kt = 0.030;       // 扭矩常数 (N·m/A)
     double gear_efficiency = 0.6;            // 减速机输出效率 η，文档建议 60~70%
     double position_offset_deg = 0.0;
+    /** 与位置/速度一致：user = motor × joint_direction（力矩反馈/指令同号约定） */
     double joint_direction = 1.0;
 };
 
@@ -81,18 +83,21 @@ public:
     static double velocityEncoderFactor(size_t motor_id = 0);
     static std::string describe(size_t motor_id = 0);
 
+    /** 电机端 Nm（不含 joint_direction） */
     static double rawTorqueToMotorTorque(int16_t torque_raw, size_t motor_id = 0);
+    /** CiA402 千分比 → 用户系输出端 Nm（含 joint_direction） */
     static double rawTorqueToOutputTorque(int16_t torque_raw, size_t motor_id = 0);
+    /** 用户系输出端 Nm → CiA402 千分比（含 joint_direction） */
     static int16_t outputTorqueToRaw(double output_torque_nm, size_t motor_id = 0);
 
     /**
-     * @brief 电机 q 轴电流 (A) ↔ CST 千分比
-     * 电流法：1000‰ ≈ max_current_ma/1000 A；否则经 τ=Kt·i 再换算输出力矩千分比
+     * @brief 电机 q 轴电流 (A) ↔ CST 千分比（电机系，不含 joint_direction）
+     * 电流法：1000‰ ≈ max_current_ma/1000 A；否则经 τ=Kt·i·N·η 再换算千分比
      */
     static int16_t currentAmpereToRaw(double current_a, size_t motor_id = 0);
     static double rawToCurrentAmpere(int16_t torque_raw, size_t motor_id = 0);
 
-    /** @brief 电机电流 1 A → 关节输出端力矩 (Nm)，即 K_t·N·η */
+    /** @brief 电机电流 1 A → 输出端力矩幅度 (Nm)，即 K_t·N·η（无符号；用户系须再 × joint_direction） */
     static double currentToOutputTorquePerAmp(size_t motor_id = 0);
 
     /** @brief 千分比 → 负载端力矩系数 (Nm @ permille=1000) */

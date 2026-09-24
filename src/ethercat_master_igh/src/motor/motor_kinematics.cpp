@@ -196,16 +196,21 @@ double MotorKinematics::rawTorqueToMotorTorque(int16_t torque_raw, size_t motor_
 
 double MotorKinematics::rawTorqueToOutputTorque(int16_t torque_raw, size_t motor_id)
 {
-    return torque_raw / 1000.0 * outputTorqueScale(motor_id);
+    const auto & p = get(motor_id);
+    // 与 pulse→° 一致：用户系 = 电机系 × joint_direction
+    return torque_raw / 1000.0 * outputTorqueScale(motor_id) * p.joint_direction;
 }
 
 int16_t MotorKinematics::outputTorqueToRaw(double output_torque_nm, size_t motor_id)
 {
+    const auto & p = get(motor_id);
     const double scale = outputTorqueScale(motor_id);
-    if (scale <= 0.0) {
+    if (scale <= 0.0 || p.joint_direction == 0.0) {
         return 0;
     }
-    const double permille = output_torque_nm / scale * 1000.0;
+    // 与 °→pulse 一致：电机系 = 用户系 / joint_direction
+    const double permille =
+      (output_torque_nm / p.joint_direction) / scale * 1000.0;
     const double clamped = std::clamp(permille, -32768.0, 32767.0);
     return static_cast<int16_t>(std::lround(clamped));
 }
@@ -221,10 +226,15 @@ int16_t MotorKinematics::currentAmpereToRaw(double current_a, size_t motor_id)
         const double permille = current_a / imax_a * 1000.0;
         return static_cast<int16_t>(std::lround(std::clamp(permille, -32768.0, 32767.0)));
     }
-    // τ_out ≈ i · Kt · torque_gear_ratio · η（与 outputTorqueScale 一致时 η 已含）
-    const double output_nm =
+    // 电机电流 → 电机系输出端力矩幅度 → 千分比（不含 joint_direction）
+    const double motor_nm =
         current_a * p.torque_constant_kt * p.torque_gear_ratio * p.gear_efficiency;
-    return outputTorqueToRaw(output_nm, motor_id);
+    const double scale = outputTorqueScale(motor_id);
+    if (scale <= 0.0) {
+        return 0;
+    }
+    const double permille = motor_nm / scale * 1000.0;
+    return static_cast<int16_t>(std::lround(std::clamp(permille, -32768.0, 32767.0)));
 }
 
 double MotorKinematics::rawToCurrentAmpere(int16_t torque_raw, size_t motor_id)

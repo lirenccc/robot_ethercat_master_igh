@@ -164,6 +164,21 @@ const std::vector<MotorProfile> kProfiles = {
         false,
         0x86,
     },
+    {
+        "SRI-M8229f32",
+        "宇立 SRI M8229f32 六维力信号处理器（PDO REAL）",
+        {
+            {0x00000E53, 0x00082291},
+        },
+        PdoLayout::SRI_M8126,
+        MotorKinematicsParams{},
+        0.0,
+        0U,
+        0U,
+        0x0000U,  // SM 同步；传感器无需电机 DC
+        false,
+        0x86,
+    },
 };
 
 bool identityEqual(const SlaveIdentity& a, const SlaveIdentity& b)

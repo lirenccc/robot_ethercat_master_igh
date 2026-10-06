@@ -62,7 +62,7 @@ struct MotorStateData {
     int32_t target_velocity;
     int16_t actual_torque;
     int32_t sensor_force_2020;  // 负载力矩 raw 槽：SJD17=0x2020；JMDT=0x310B；未映射为 0
-    int32_t motor_encoder_2021;  // SJD17 电机端（减速器输入端）编码器 (TxPDO 0x2021)；未映射时为 0
+    int32_t motor_encoder_2021;  // 电机端编码器 raw：SJD17=0x2021；JMDT=0x3108；未映射时为 0
     uint16_t error_code;  // 驱动错误码 (0x603F)；未映射/无故障时为 0
     int16_t target_torque;
     
@@ -337,7 +337,7 @@ public:
     int32_t getSensorForce2020(uint8_t motor_id) const;
 
     /**
-     * @brief 获取电机端（减速器输入端）编码器原始值（PDO 0x2021）
+     * @brief 获取电机端编码器原始值（SJD17：PDO 0x2021；JMDT：PDO 0x3108）
      * @param motor_id 电机 ID
      * @return SJD17 映射时为 raw；NH17 等未映射时恒为 0
      */
@@ -505,7 +505,7 @@ private:
         unsigned int actual_velocity;
         unsigned int actual_torque;
         unsigned int sensor_force_2020;  // 0x2020；未映射时为 0
-        unsigned int motor_encoder_2021;  // 0x2021；未映射时为 0
+        unsigned int motor_encoder_2021;  // 0x2021 或 JMDT 0x3108；未映射时为 0
         unsigned int error_code;          // 0x603F；未映射时为 kPdoOffsetUnset
         unsigned int digital_inputs;
         
@@ -642,7 +642,7 @@ private:
     std::vector<int32_t> last_actual_velocities_;     // 实际速度 (0x606C)
     std::vector<int16_t> last_actual_torques_;        // 实际力矩 (0x6077)
     std::vector<int32_t> last_sensor_force_2020_;     // 输出端力矩传感器 (0x2020)
-    std::vector<int32_t> last_motor_encoder_2021_;    // 电机端编码器 (0x2021)
+    std::vector<int32_t> last_motor_encoder_2021_;    // 电机端编码器 (0x2021 / JMDT 0x3108)
     mutable SeqLock pdo_cache_seq_;
     
     // ========== 网关数据缓存（每周期更新，供外部访问） ==========

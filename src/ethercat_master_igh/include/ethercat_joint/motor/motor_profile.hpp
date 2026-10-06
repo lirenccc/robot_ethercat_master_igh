@@ -23,9 +23,9 @@ enum class PdoLayout {
     UNKNOWN = 0,
     JOINT_MODULE,   ///< 标准关节模组 PDO：0x1600/0x1A00（IgH 新奇 14B；SJD17 Tx 22B 含 0x2020/0x2021；新奇 ENI 另可含 0x603F）
     GATEWAY,
-    /** CoolDrive JMDT（天机 Marvin）：Rx 6040/6060/5FFE/607A/60FF/6071；Tx 6041/6061/5FFE/6064/606C/6077/310B */
+    /** CoolDrive JMDT（天机 Marvin）：Rx 6040/6060/5FFE/607A/60FF/6071；Tx 6041/6061/5FFE/6064/606C/6077/310B/3108 */
     COOLDRIVE_JMDT,
-    /** 宇立 SRI M8126 六维力信号处理器：Rx 0x1601/0x7010；Tx f32=0x1A03/0x6030，i32=0x1A02/0x6020 */
+    /** 宇立 SRI 六维力信号处理器（M8126 / M8229）：Rx 0x1601/0x7010；Tx f32=0x1A03/0x6030，i32=0x1A02/0x6020 */
     SRI_M8126,
 };
 

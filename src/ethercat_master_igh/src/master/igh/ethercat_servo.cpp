@@ -33,6 +33,7 @@ constexpr uint32_t kGatewayVendorId = 0x00000130;
 constexpr uint32_t kGatewayProductCode = 0x01300060;
 constexpr uint32_t kSriVendorId = 0x00000E53;
 constexpr uint32_t kSriProductF32 = 0x00081261;
+constexpr uint32_t kSriM8229ProductF32 = 0x00082291;
 // 三木禾 SJD-17：不读 SDO 运动学，编码器在减速器输出端（19bit=524288，位置减速比 1）
 constexpr uint32_t kSjd17VendorId = 0x000009CF;
 constexpr uint32_t kSjd17ProductCode = 0x00010001;
@@ -140,7 +141,12 @@ inline bool isSriM8126(const MotorConfig& cfg)
 
 inline bool isSriM8126F32(const MotorConfig& cfg)
 {
-    return cfg.vendor_id == kSriVendorId && cfg.product_code == kSriProductF32;
+    if (cfg.vendor_id == kSriVendorId &&
+        (cfg.product_code == kSriProductF32 ||
+         cfg.product_code == kSriM8229ProductF32)) {
+        return true;
+    }
+    return cfg.model_id.find("f32") != std::string::npos;
 }
 
 inline bool isNonMotionSlave(const MotorConfig& cfg)
@@ -886,7 +892,7 @@ bool EtherCATServo::configurePDOMapping()
         if (isCoolDriveJmdtMotor(cfg)) {
             if (i == 0) {
                 std::cout << "[IgH] CoolDrive JMDT PDO 0x1600/0x1A00 "
-                          << "(Rx:6040/6060/5FFE/607A/60FF/6071; Tx:+0x310B)" << std::endl;
+                          << "(Rx:6040/6060/5FFE/607A/60FF/6071; Tx:+0x310B/+0x3108)" << std::endl;
             }
             static const ec_pdo_entry_info_t jmdt_rx_entries[] = {
                 {0x6040, 0x00, 16},
@@ -904,12 +910,13 @@ bool EtherCATServo::configurePDOMapping()
                 {0x606C, 0x00, 32},
                 {0x6077, 0x00, 16},
                 {0x310B, 0x00, 32},
+                {0x3108, 0x00, 32},
             };
             static const ec_pdo_info_t jmdt_rx_pdos[] = {
                 {0x1600, 6, jmdt_rx_entries},
             };
             static const ec_pdo_info_t jmdt_tx_pdos[] = {
-                {0x1A00, 7, jmdt_tx_entries},
+                {0x1A00, 8, jmdt_tx_entries},
             };
             const ec_sync_info_t jmdt_syncs[] = {
                 {2, EC_DIR_OUTPUT, 1, jmdt_rx_pdos, EC_WD_ENABLE},
@@ -1964,7 +1971,11 @@ bool EtherCATServo::registerPDOEntries()
             ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i], 0x310B, 0x00, domain_in_, nullptr);
             if (ret < 0) { std::cerr << tag << ": Failed to register 0x310B" << std::endl; return false; }
             offsets.sensor_force_2020 = ret;
-            offsets.motor_encoder_2021 = 0;
+
+            // 0x3108 电机端编码器 → 复用 motor_encoder_2021 槽位（产品侧同字段读取）
+            ret = ecrt_slave_config_reg_pdo_entry(slave_configs_[i], 0x3108, 0x00, domain_in_, nullptr);
+            if (ret < 0) { std::cerr << tag << ": Failed to register 0x3108" << std::endl; return false; }
+            offsets.motor_encoder_2021 = ret;
 
             if (!verifyPdoEvidence(i)) {
                 return false;

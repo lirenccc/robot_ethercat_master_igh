@@ -87,7 +87,7 @@ struct AxisCommand
 {
   double position{0.0};  // rad; non-finite → skip (leave last target)
   double velocity{0.0};  // rad/s; non-finite → skip
-  double effort{0.0};    // Nm; applied only when this cycle requests CST (see cycle())
+  double effort{0.0};    // Nm; non-finite → skip. Written to 0x6071 in every mode.
   bool enable{true};     // always applied each cycle (true=request enable FSM)
   /// CiA402 mode; 0 = do not change this cycle
   int8_t operation_mode{0};

@@ -402,10 +402,7 @@ bool Master::cycle(
           true,
           ethercat_joint::SetpointSource::External);
       }
-      if (std::isfinite(cmd.effort) &&
-        servo_->getOperationMode(id) ==
-        ethercat_joint::OperationMode::CYCLIC_SYNC_TORQUE)
-      {
+      if (std::isfinite(cmd.effort)) {
         const int16_t raw =
           ethercat_joint::MotorKinematics::outputTorqueToRaw(cmd.effort, i);
         servo_->setTargetTorque(id, raw, ethercat_joint::SetpointSource::External);

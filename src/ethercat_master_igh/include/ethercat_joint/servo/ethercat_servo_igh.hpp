@@ -19,6 +19,7 @@
 #include "ethercat_joint/master/igh/ethercat_sync.hpp"
 #include "ethercat_joint/master/igh/igh_master_runtime.hpp"
 #include "ethercat_joint/force_sensor/force_sensor.hpp"
+#include "ethercat_joint/motor/csp_setpoint_blend.hpp"
 #include "ethercat_joint/motor/motor_profile.hpp"
 #include "ethercat_joint/diagnostics/runtime_logger.hpp"
 #include "ethercat_joint/servo/cia402.hpp"
@@ -616,6 +617,8 @@ private:
     std::vector<std::deque<int32_t>> position_filter_buffers_;
     size_t position_filter_size_;  // 滤波器大小，默认3（延迟125us）
     std::vector<bool> position_override_active_;  // 标志：是否从外部覆盖位置（轨迹规划器）
+    /** Job 线程独占。主机目标慢于总线时，按总线周期均分后再写入 0x607A。 */
+    std::vector<CspSetpointBlend> csp_setpoint_blends_;
     std::vector<int32_t> idle_input_positions_;  // 静止时输入到buffer的位置值（保持位置）
     
     // CSV模式速度控制

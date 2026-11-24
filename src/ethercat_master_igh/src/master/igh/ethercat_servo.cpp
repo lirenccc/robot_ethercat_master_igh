@@ -425,6 +425,7 @@ bool EtherCATServo::initialize(const std::vector<MotorConfig>& motor_configs)
     // motor_count_ 包括网关，但滤波器只用于电机
     position_filter_buffers_.resize(motor_count_);
     position_override_active_.resize(motor_count_, false);
+    csp_setpoint_blends_.assign(motor_count_, CspSetpointBlend{});
     safe_latched_positions_.assign(motor_count_, 0);
     idle_input_positions_.resize(motor_count_, 0);  // 初始化静止输入位置为0
     
@@ -2736,29 +2737,19 @@ void EtherCATServo::sendDataCommon(size_t i, const PDOOffsets& offsets)
 
 void EtherCATServo::sendDataCSP(size_t i, const PDOOffsets& offsets)
 {
-    // CSP模式：
-    // 1. 静止时：使用idle_input_positions_[i]填充buffer并保持位置
-    // 2. 运动时：轨迹规划器通过setTargetPosition设置目标位置
-    // 使用可配置大小的平均滤波（默认3点）
-    
-    // // ⭐ 关键调试：输出前5次调用的状态
-    // static std::map<size_t, int> call_count;
-    // if (call_count[i]++ < 5) {
-    //     std::cout << "[sendDataCSP] 电机" << i << " 第" << call_count[i] << "次: "
-    //               << "activated=" << activated_ 
-    //               << ", override=" << position_override_active_[i]
-    //               << ", target_pos=" << target_positions_[i]
-    //               << ", idle_pos=" << idle_input_positions_[i] << std::endl;
-    // }
-    
+    // 静止时用 idle 位置。运动时主机目标若慢于总线，按总线周期均分后写入 0x607A。
     if (activated_ && !position_override_active_[i]) {
-        // ⭐ 停止状态：直接使用idle_input_positions_作为目标位置，不经过滤波器
-        // 这样可以立即响应idle位置的变化，避免滤波延迟
+        // 停止状态：直接使用 idle 位置作为目标，不经过拆分
         target_positions_[i].store(idle_input_positions_[i], std::memory_order_relaxed);
     }
-    
-    // 写入目标位置（无论是否激活都要写入）- 使用原子读取
-    int32_t target_pos = target_positions_[i].load(std::memory_order_acquire);
+
+    const int32_t goal = target_positions_[i].load(std::memory_order_acquire);
+    int32_t target_pos = goal;
+    if (i < csp_setpoint_blends_.size()) {
+        target_pos = stepCspSetpointBlend(
+            csp_setpoint_blends_[i], goal, getMonotonicTimeNs(),
+            static_cast<uint64_t>(busCycleUs()) * 1000ULL);
+    }
     EC_WRITE_S32(domain_out_pd_ + offsets.target_position, target_pos);
 }
 
@@ -4196,6 +4187,10 @@ void EtherCATServo::applySafeProcessImageOutputs()
 
         control_word_states_[i].store(safe_control_word, std::memory_order_relaxed);
         target_positions_[i].store(safe.target_position, std::memory_order_relaxed);
+        if (i < csp_setpoint_blends_.size()) {
+            resetCspSetpointBlend(
+                csp_setpoint_blends_[i], safe.target_position, getMonotonicTimeNs());
+        }
         target_velocities_[i].store(safe.target_velocity, std::memory_order_relaxed);
         target_torques_[i].store(safe.target_torque, std::memory_order_relaxed);
         position_override_active_[i] = false;

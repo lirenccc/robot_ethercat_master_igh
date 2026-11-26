@@ -84,6 +84,7 @@ struct timespec EtherCATSync::getSleepSpec(uint64_t wakeup_time_ns) const
  
 int32_t EtherCATSync::process(uint64_t app_time_ns)
 {
+    last_ref_clock_read_failed_ = false;
     if (!master_) {
         return 0;
     }
@@ -136,6 +137,7 @@ int32_t EtherCATSync::process(uint64_t app_time_ns)
             ++consecutive_ref_successes_;
         } else if (attempt_ref_read) {
             // 本拍尝试读回但失败：保持上次有效差值，避免 DC 补偿突变
+            last_ref_clock_read_failed_ = true;
             dc_diff_ns_ = have_good_dc_diff_ ? last_good_dc_diff_ns_ : 0;
             consecutive_ref_successes_ = 0;
             ++consecutive_ref_failures_;

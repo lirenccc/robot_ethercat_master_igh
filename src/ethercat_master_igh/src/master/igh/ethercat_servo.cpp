@@ -3388,6 +3388,31 @@ void EtherCATServo::syncSlaveClocks()
     ecrt_master_sync_slave_clocks(master_);
 }
 
+bool EtherCATServo::referenceClockReadFailed() const
+{
+    return sync_handler_ && sync_handler_->referenceClockReadFailed();
+}
+
+bool EtherCATServo::motionAxesOperationEnabled() const
+{
+    if (!activated_ || motor_count_ == 0 ||
+        motor_configs_.size() < motor_count_ ||
+        last_status_words_.size() < motor_count_) {
+        return false;
+    }
+    bool any_motion_axis = false;
+    for (size_t i = 0; i < motor_count_; ++i) {
+        if (isNonMotionSlave(motor_configs_[i])) {
+            continue;
+        }
+        any_motion_axis = true;
+        if (!isCiA402OperationEnabled(last_status_words_[i])) {
+            return false;
+        }
+    }
+    return any_motion_axis;
+}
+
 uint64_t EtherCATServo::getReferenceClockTime() const
 {
     if (!activated_) return 0;

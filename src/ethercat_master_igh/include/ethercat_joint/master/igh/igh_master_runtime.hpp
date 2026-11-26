@@ -98,7 +98,7 @@ private:
   bool applyThreadRealtime(int fifo_priority, std::atomic<bool> * rt_ok_out);
   void latchCommFault();
   void syncMotionReenableFlag();
-  void sampleDcMonitor(EtherCATServo * servo);
+  void sampleDcMonitor(EtherCATServo * servo, bool suppress_link_latch);
 
   static void timingThreadMain(IghMasterRuntime * self);
   static void jobThreadMain(IghMasterRuntime * self);

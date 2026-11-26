@@ -366,12 +366,15 @@ bool Master::cycle(
       st.position = pos_deg * kDegToRad;
       st.velocity = vel_deg_s * kDegToRad;
       st.effort = 0.0;
-      st.enabled = false;
-      st.fault = true;
+      // 通信闩锁期间不下发运动指令。使能与故障仍取状态字，不在这里改写。
       if (i < motor_states.size()) {
+        st.enabled = ethercat_joint::isCiA402OperationEnabled(motor_states[i].status_word);
+        st.fault = motor_states[i].fault;
         st.status_word = motor_states[i].status_word;
         st.error_code = motor_states[i].error_code;
       } else {
+        st.enabled = false;
+        st.fault = false;
         st.status_word = 0;
         st.error_code = 0;
       }

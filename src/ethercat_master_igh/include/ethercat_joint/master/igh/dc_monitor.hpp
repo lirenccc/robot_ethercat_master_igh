@@ -41,6 +41,18 @@ inline bool dcOutOfSyncAnomaly(const DcStatusSample & sample) noexcept
     return sample.status_valid && !sample.in_sync;
 }
 
+/**
+ * 参考时钟读失败，但本拍过程数据工作计数完整、运动轴仍 Operation Enabled。
+ * 该拍不计入 deadline / DC 通信闩锁，也不因此进入安全输出。
+ */
+inline bool referenceClockReadKeepsLink(
+    bool read_failed,
+    bool working_counter_complete,
+    bool drives_operation_enabled) noexcept
+{
+    return read_failed && working_counter_complete && drives_operation_enabled;
+}
+
 inline uint64_t absDeviationNs(int32_t deviation_ns) noexcept
 {
     return static_cast<uint64_t>(std::llabs(static_cast<long long>(deviation_ns)));

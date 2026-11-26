@@ -211,6 +211,15 @@ public:
      * @return DC参考时钟时间（纳秒），如果未激活则返回0
      */
     uint64_t getReferenceClockTime() const;
+
+    /** 本拍 process() 尝试读参考时钟且失败。 */
+    bool referenceClockReadFailed() const;
+
+    /**
+     * 运动轴状态字均为 Operation Enabled（bit3 清、bit2 置）。
+     * 供 Job 判断参考时钟读失败是否只是读回失败。
+     */
+    bool motionAxesOperationEnabled() const;
     
     /**
      * @brief 对齐DC时间基准到系统时间

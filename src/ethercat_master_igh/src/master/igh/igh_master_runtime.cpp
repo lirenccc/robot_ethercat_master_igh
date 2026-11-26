@@ -220,7 +220,7 @@ IghJobCycleDiag IghMasterRuntime::jobCycleDiag() const
   return d;
 }
 
-void IghMasterRuntime::sampleDcMonitor(EtherCATServo * servo)
+void IghMasterRuntime::sampleDcMonitor(EtherCATServo * servo, bool suppress_link_latch)
 {
   const bool valid = servo ? servo->isDcStatusValid() : false;
   const int32_t diff = servo ? servo->lastDcDiffNs() : 0;
@@ -245,7 +245,7 @@ void IghMasterRuntime::sampleDcMonitor(EtherCATServo * servo)
     return;
   }
 
-  const bool anomaly = dcOutOfSyncAnomaly(sample);
+  const bool anomaly = !suppress_link_latch && dcOutOfSyncAnomaly(sample);
   const AnomalyStats dc_stats = dc_tracker_.observe(anomaly);
   dc_out_of_sync_count_.store(dc_stats.total, std::memory_order_relaxed);
   dc_out_of_sync_consecutive_.store(dc_stats.consecutive, std::memory_order_relaxed);
@@ -330,6 +330,8 @@ void IghMasterRuntime::jobThreadMain(IghMasterRuntime * self)
     const bool armed = self->operational_.load(std::memory_order_acquire);
     const bool rx_ok = servo->runJobCycle(self->safeOutputRequired(), app_time);
     self->last_rx_ok_.store(rx_ok, std::memory_order_relaxed);
+    const bool clock_keeps_link = referenceClockReadKeepsLink(
+      servo->referenceClockReadFailed(), rx_ok, servo->motionAxesOperationEnabled());
 
     if (armed && !self->commFault()) {
       const auto wkc = self->wkc_tracker_.observe(!rx_ok);
@@ -349,13 +351,15 @@ void IghMasterRuntime::jobThreadMain(IghMasterRuntime * self)
     self->diag_deadline_met_.store(self->timing_stats_.deadline_met, std::memory_order_relaxed);
 
     if (armed && !self->commFault() && self->config_.require_realtime) {
-      const auto dl = self->deadline_tracker_.observe(!self->timing_stats_.deadline_met);
+      const bool deadline_anomaly =
+        !clock_keeps_link && !self->timing_stats_.deadline_met;
+      const auto dl = self->deadline_tracker_.observe(deadline_anomaly);
       if (dl.stop_required) {
         self->latchCommFault();
       }
     }
 
-    self->sampleDcMonitor(servo);
+    self->sampleDcMonitor(servo, clock_keeps_link);
 
     // Healthy 组成对齐 EC-Master：rx_ok ∧ deadline_met ∧ dc_ok ∧ !comm_fault。
     // dc_ok：PLL 未就绪时不挡 dwell；就绪后要求 in_sync。

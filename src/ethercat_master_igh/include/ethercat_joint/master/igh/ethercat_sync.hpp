@@ -76,6 +76,9 @@
     bool isDcPllActive() const {
         return dc_started_ && !ref_clock_read_disabled_;
     }
+
+    /** 本拍尝试读参考时钟且失败。退避间隔内未读时为 false。 */
+    bool referenceClockReadFailed() const { return last_ref_clock_read_failed_; }
  
  private:
      /** 调用 ecrt_master_reference_clock_time，抑制 libethercat 的 stderr 刷屏 */
@@ -119,6 +122,7 @@
     bool have_good_dc_diff_ = false;
     bool ref_clock_read_disabled_ = false;
     bool ref_clock_disable_logged_ = false;
+    bool last_ref_clock_read_failed_ = false;
  
      // 辅助函数：符号函数
      template <typename T> 
